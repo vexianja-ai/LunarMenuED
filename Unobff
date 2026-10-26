@@ -1,5 +1,11 @@
 --[[
-	LUNAR MENU — v2.1.5
+	LUNAR MENU — v2.1.6
+	+ GOD WEAPON Simulation (Miscellaneous):
+	    - blocks all non-executor AttemptToolUse fires while a GOD WEAPON is detected
+	    - fires our own AttemptToolUse on M1 (PC) / HUD Use button (mobile)
+	    - hitbox range gate, optional hitbox visual, optional detection notification
+	    - item replacement box (falls back to the current throwable name)
+	    - warns on missing critical functions
 	+ keybind button is now a square keycap instead of a rectangle
 	+ click the minimised square to expand it (dragging still repositions)
 	+ resize corner brackets are hidden while minimised
@@ -93,6 +99,7 @@ local SpearReplicationHit = RemoteOther and RemoteOther:FindFirstChild("SpearRep
 local ThrownSpearReplication = RemoteOther and RemoteOther:FindFirstChild("ThrownSpearReplication")
 local BuildPlaceRemote = RemoteMain and (RemoteMain:FindFirstChild("BuildPlace") or RemoteMain:WaitForChild("BuildPlace", 5))
 local ChangeValueRemote = RemoteMain and (RemoteMain:FindFirstChild("ChangeValue") or RemoteMain:WaitForChild("ChangeValue", 5))
+local AttemptToolUse = RemoteOther and (RemoteOther:FindFirstChild("AttemptToolUse") or RemoteOther:WaitForChild("AttemptToolUse", 5))
 
 local function httpGet(url)
 	if type(game.HttpGet) == "function" then
@@ -145,7 +152,7 @@ local changeValueMode = "add"
 local minimizeScale = 100
 local keybindsEnabled = true
 
-local uiRefs = { goToPage = nil, minimized = false, gui = nil, cancelBuild = nil }
+local uiRefs = { goToPage = nil, minimized = false, gui = nil, cancelBuild = nil, mainFrame = nil }
 local currentPageName = "General"
 
 ----------------------------------------------------
@@ -231,7 +238,7 @@ end
 ----------------------------------------------------
 local LOGO_ID = "rbxassetid://8498174594"
 local KEYBIND_IMG = "rbxassetid://126810011338788"
-local VERSION = "v2.1.5"
+local VERSION = "v2.1.6"
 
 local function make(class, props, parent)
 	local i = Instance.new(class)
@@ -741,8 +748,8 @@ end)
 ----------------------------------------------------
 -- SPEAR ENGINE
 ----------------------------------------------------
-local hookmetamethod, getnamecallmethod, newcclosure, checkcaller, getconnections =
-	hookmetamethod, getnamecallmethod, newcclosure, checkcaller, getconnections
+local hookmetamethod, getnamecallmethod, newcclosure, checkcaller, getconnections, hookfunction =
+	hookmetamethod, getnamecallmethod, newcclosure, checkcaller, getconnections, hookfunction
 
 local HOOK_DEPS = { "hookmetamethod", "getnamecallmethod", "newcclosure", "checkcaller", "getconnections" }
 local hookWarned = false
@@ -1118,6 +1125,197 @@ local function throwAt(targetPos, hitInstance, countOverride, itemOverride, dela
 end
 
 ----------------------------------------------------
+-- GOD WEAPON SIMULATION
+----------------------------------------------------
+local god = {
+	Enabled = false,
+	Range = 8,
+	ShowHitbox = false,
+	ShowNotif = true,
+	ItemReplacement = "",
+	Detected = false,
+	HooksInstalled = false,
+	Hitbox = nil,
+	MobileBtn = nil,
+	MobileConn = nil,
+}
+
+local function godItemName()
+	if god.ItemReplacement and god.ItemReplacement ~= "" then return god.ItemReplacement end
+	return currentThrowableName
+end
+
+-- true while simulating and a GOD WEAPON is present
+local function godActive()
+	return god.Enabled and god.Detected
+end
+
+-- true when the call originates from our own executor context
+local function godIsOurCall()
+	if type(checkcaller) == "function" then
+		local ok, res = pcall(checkcaller)
+		return ok and res == true
+	end
+	return false
+end
+
+-- decide for a single incoming AttemptToolUse call: block foreign, let ours through untouched
+local function godShouldBlock()
+	return godActive() and not godIsOurCall()
+end
+
+local function godTargetInRange()
+	local ch = LocalPlayer.Character
+	local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+	if not hrp then return false end
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl ~= LocalPlayer and pl.Character then
+			local tr = pl.Character:FindFirstChild("HumanoidRootPart")
+			local hum = pl.Character:FindFirstChildOfClass("Humanoid")
+			if tr and hum and hum.Health > 0 and (tr.Position - hrp.Position).Magnitude <= god.Range then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+-- our own fire, with our own argument, only when something is in the hitbox
+local function godFire()
+	if not godActive() then return end
+	if UserInputService:GetFocusedTextBox() then return end
+	if not godTargetInRange() then return end
+	if AttemptToolUse then AttemptToolUse:FireServer(godItemName()) end
+end
+
+local function godMouseOverMenu()
+	local f = uiRefs.mainFrame
+	if not f or not f.Parent or uiRefs.minimized then return false end
+	local mp = UserInputService:GetMouseLocation()
+	local ap, as = f.AbsolutePosition, f.AbsoluteSize
+	return mp.X >= ap.X and mp.X <= ap.X + as.X and mp.Y >= ap.Y and mp.Y <= ap.Y + as.Y
+end
+
+local function checkGodFunctions()
+	local missing = {}
+	if type(hookmetamethod) ~= "function" then table.insert(missing, "hookmetamethod") end
+	if type(getnamecallmethod) ~= "function" then table.insert(missing, "getnamecallmethod") end
+	if type(hookfunction) ~= "function" then table.insert(missing, "hookfunction") end
+	if type(checkcaller) ~= "function" then table.insert(missing, "checkcaller") end
+	if #missing > 0 then
+		showNotification("Critical Functions missing: " .. table.concat(missing, ", ") .. ". Option may not work.", 5)
+	end
+	return #missing == 0
+end
+
+local function installGodHooks()
+	if god.HooksInstalled or not AttemptToolUse then return end
+	god.HooksInstalled = true
+
+	-- Event:FireServer(...)
+	if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" and type(newcclosure) == "function" then
+		local oldNamecall
+		oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(...)
+			local self = ...
+			if rawequal(self, AttemptToolUse) and getnamecallmethod() == "FireServer" then
+				if godShouldBlock() then return end
+			end
+			return oldNamecall(...)
+		end))
+	end
+
+	-- Event.FireServer(Event, ...)
+	if type(hookfunction) == "function" then
+		local oldFire
+		oldFire = hookfunction(AttemptToolUse.FireServer, function(self, ...)
+			if rawequal(self, AttemptToolUse) then
+				if godShouldBlock() then return end
+			end
+			return oldFire(self, ...)
+		end)
+	end
+end
+
+local function godHitboxPart()
+	if god.Hitbox and god.Hitbox.Parent then return god.Hitbox end
+	local p = Instance.new("Part")
+	p.Name = "LunarGodWeaponHitbox"
+	p.Shape = Enum.PartType.Ball
+	p.Size = Vector3.new(god.Range * 2, god.Range * 2, god.Range * 2)
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.CastShadow = false
+	p.Material = Enum.Material.ForceField
+	p.Color = T.Warn
+	p.Transparency = 0.8
+	p.Parent = Workspace
+	god.Hitbox = p
+	return p
+end
+
+local function hookGodMobile()
+	if not IS_MOBILE then return false end
+	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	local hud = pg and pg:FindFirstChild("HUD")
+	local mb = hud and hud:FindFirstChild("MobileButtons")
+	local btn = mb and mb:FindFirstChild("UseButton")
+	if not btn then return false end
+	if god.MobileBtn == btn and god.MobileConn then return true end
+	if god.MobileConn then pcall(function() god.MobileConn:Disconnect() end) end
+	god.MobileBtn = btn
+	god.MobileConn = btn.Activated:Connect(function()
+		godFire()
+	end)
+	return true
+end
+
+-- our own trigger on PC
+UserInputService.InputBegan:Connect(function(i, gp)
+	if gp or IS_MOBILE then return end
+	if i.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+	if not godActive() then return end
+	if godMouseOverMenu() then return end
+	godFire()
+end)
+
+-- hitbox visual
+RunService.Heartbeat:Connect(function()
+	if god.Enabled and god.ShowHitbox then
+		local p = godHitboxPart()
+		local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+		if hrp then
+			p.Size = Vector3.new(god.Range * 2, god.Range * 2, god.Range * 2)
+			p.CFrame = CFrame.new(hrp.Position)
+			p.Transparency = 0.8
+		else
+			p.Transparency = 1
+		end
+	elseif god.Hitbox and god.Hitbox.Parent then
+		god.Hitbox.Transparency = 1
+	end
+end)
+
+-- detection watcher
+task.spawn(function()
+	while task.wait(0.4) do
+		if god.Enabled then
+			local ch = LocalPlayer.Character
+			local found = ch and ch:FindFirstChild("GOD WEAPON", true)
+			if found and not god.Detected then
+				god.Detected = true
+				if god.ShowNotif then showNotification("GOD WEAPON detected, simulating", 2.5) end
+			elseif not found and god.Detected then
+				god.Detected = false
+			end
+		elseif god.Detected then
+			god.Detected = false
+		end
+	end
+end)
+
+----------------------------------------------------
 -- GLOBAL INPUT
 ----------------------------------------------------
 UserInputService.InputBegan:Connect(function(input, gp)
@@ -1372,6 +1570,7 @@ createMasterUI = function()
 	corner(main, 14)
 	local mainStroke = stroke(main, T.Accent, 0.25, 1.5)
 	themeGradient(main, "Bg1", "Bg2", 135)
+	uiRefs.mainFrame = main
 
 	local sheenHolder = make("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, ClipsDescendants = true, ZIndex = 2 }, main)
 	corner(sheenHolder, 14)
@@ -3111,7 +3310,7 @@ createMasterUI = function()
 		createSlider(protBody, "Extras Interval", 0.2, 10, protectExtras.Interval, 0.2, function(v) protectExtras.Interval = v end, "Loop delay for custom item")
 		createTextBox(protBody, "Custom Item (protect only)", "e.g. Boulder", protectExtras.CustomItem, function(v) protectExtras.CustomItem = v end, "Leave empty to use the throwable only")
 		createSlider(protBody, "Custom Item Count", 1, 80, protectExtras.Count, 1, function(v) protectExtras.Count = v end, "Items per protect throw")
-		createTextBox(protBody, "Delay After Item", "e.g. 0.08", tostring(protectExtras.Delay), function(v)
+		createTextBox(protBody, "Delay After Item", "e.g. 0.08", tostring(protExtras and protectExtras.Delay or 0.08), function(v)
 			local n = tonumber(v); if n then protectExtras.Delay = n end
 		end, "Delay between protect throws")
 
@@ -3130,6 +3329,48 @@ createMasterUI = function()
 		createSlider(spreadBody, "Duration", 1, 30, spreadCfg.Duration, 1, function(v) spreadCfg.Duration = v end, "How long the attack spams for (seconds)")
 		local runSpread = createButton(spreadBody, "Spread Attack Now", Color3.fromRGB(150, 60, 190), "Run one full spread attack")
 		runSpread.MouseButton1Click:Connect(function() startSpreadAttack() end)
+
+		------------------------------------------------
+		-- GOD WEAPON SIMULATION
+		------------------------------------------------
+		sectionTitle(p, "GOD WEAPON Simulation")
+		createToggleKeybind(p, "Simulate GOD WEAPON", god.Enabled, function(v)
+			god.Enabled = v
+			if v then
+				checkGodFunctions()
+				installGodHooks()
+				if IS_MOBILE then
+					task.spawn(function()
+						for _ = 1, 15 do
+							if hookGodMobile() then break end
+							task.wait(1)
+						end
+					end)
+				end
+				if not AttemptToolUse then
+					showNotification("AttemptToolUse remote not found", 2.5)
+				else
+					showNotification("GOD WEAPON simulation ON", 1.5)
+				end
+			else
+				god.Detected = false
+				if god.Hitbox and god.Hitbox.Parent then god.Hitbox.Transparency = 1 end
+				showNotification("GOD WEAPON simulation OFF", 1.5)
+			end
+		end, Enum.KeyCode.Unknown, "Block the game's tool fire and send your own while a GOD WEAPON is equipped")
+
+		local _, godBody = createExpandPanel(p, "GOD WEAPON Settings", "Hitbox, notifications and item replacement")
+		createSlider(godBody, "Hitbox Range", 1, 20, god.Range, 1, function(v) god.Range = v end,
+			"Hitbox radius in studs (max 20)")
+		createToggle(godBody, "Show Hitbox", god.ShowHitbox, function(v)
+			god.ShowHitbox = v
+			if not v and god.Hitbox and god.Hitbox.Parent then god.Hitbox.Transparency = 1 end
+		end, "Show a part visualising the hitbox", false)
+		createToggle(godBody, "Show Notification", god.ShowNotif, function(v) god.ShowNotif = v end,
+			"Notify each time a GOD WEAPON is detected", false)
+		createTextBox(godBody, "Item Replacement", "defaults to throwable name", god.ItemReplacement, function(v)
+			god.ItemReplacement = v
+		end, "Item fired instead — leave empty to use the throwable name")
 
 		------------------------------------------------
 		-- GAME TELEPORTER
