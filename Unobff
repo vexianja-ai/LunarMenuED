@@ -1,17 +1,19 @@
 --[[
-	LUNAR MENU — v2.3 "final pass"
-	+ Concurrent settings (incl. Multi Line) moved into a dropdown panel
-	+ item preview camera pulled closer to the model
-	+ builder offsets now accumulate across ALL modified axes + persist in config
-	+ real Save Config button with dirty indicator + Auto Save toggle
-	+ CLOSE_SCRIPT variable — runs whatever you put in it when X tears the menu down
-	+ FIX: MouseButton1Leave -> MouseLeave (was aborting createMasterUI mid-build)
-	+ FIX: loading screen hang (ImageTransparency tweened on TextLabel killed the finish thread)
-	+ loading screen is a compact centered card, NOT full screen
-	+ config: folder/file existence checks before creating anything
-	+ safe module/remote fetching (timeouts, nil guards, pcall) | structure lookup hardened
-	+ combined [keybind][switch] rows | Animal ESP + ignore list | close (X)
-	+ middle-mouse Multi Line | arrow-key page nav | live HSV theme personalization (saved)
+	LUNAR MENU — v2.1.4
+	+ keybinds are now manual: [+] next to each row -> press a key -> keycap image + key text
+	+ config on disk is ONLY keybinds + theme (lean save)
+	+ every colour in the palette is now editable (14 pickers)
+	+ UI parented to gethui() when available
+	+ Settings: keybinds master switch, modify keybind, remove keybinds (multi), clear all,
+	            minimize-square size slider, keybind for minimize/expand
+	+ Esc hides the whole UI (rebindable)
+	+ version text + your avatar/username in the title bar
+	+ General: Rejoin + Server Hop
+	+ Miscellaneous: Game Teleporter by PlaceId or name (shows icon + name)
+	+ minimise is now a square with an outline and the logo centred (scalable 50-200%)
+	+ FIX: construct mode locking the mouse on PC (viewport cameras are Scriptable now)
+	+ FIX: MouseButton1Leave -> MouseLeave | loading screen hang | full-screen loading card
+	+ feature ranges all live in their own "[name] Settings" dropdowns
 ]]--
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -24,20 +26,30 @@ local Lighting = game:GetService("Lighting")
 local SoundService = game:GetService("SoundService")
 local Debris = game:GetService("Debris")
 local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local MarketplaceService = game:GetService("MarketplaceService")
 
 local LocalPlayer = Players.LocalPlayer
 
 ----------------------------------------------------
 -- CLOSE ACTION  <<< FILL THIS IN LATER >>>
--- Runs AFTER the X button has torn the menu down and disabled everything.
--- Paste any Lua chunk. Examples:
---   CLOSE_SCRIPT = [[ print("menu closed") ]]
---   CLOSE_SCRIPT = [[ loadstring(game:HttpGet("https://example.com/script.lua"))() ]]
 ----------------------------------------------------
-local CLOSE_SCRIPT = [[ loadstring(gane:HttpGet("https://raw.githubusercontent.com/vexianja-ai/LunarED/refs/heads/main/Menu"))() ]]
+local CLOSE_SCRIPT = [[ game:HttpGet("https://raw.githubusercontent.com/vexianja-ai/LunarED/refs/heads/main/Menu") ]]
 
 ----------------------------------------------------
--- SAFE FETCHING (never yield forever, never hard-error)
+-- UI PARENT (gethui when available)
+----------------------------------------------------
+local function getUiParent()
+	if type(gethui) == "function" then
+		local ok, hui = pcall(gethui)
+		if ok and hui then return hui end
+	end
+	return LocalPlayer:WaitForChild("PlayerGui")
+end
+local UI_PARENT = getUiParent()
+
+----------------------------------------------------
+-- SAFE FETCHING
 ----------------------------------------------------
 local function waitChild(parent, ...)
 	local node = parent
@@ -78,6 +90,25 @@ local ThrownSpearReplication = RemoteOther and RemoteOther:FindFirstChild("Throw
 local BuildPlaceRemote = RemoteMain and (RemoteMain:FindFirstChild("BuildPlace") or RemoteMain:WaitForChild("BuildPlace", 5))
 local ChangeValueRemote = RemoteMain and (RemoteMain:FindFirstChild("ChangeValue") or RemoteMain:WaitForChild("ChangeValue", 5))
 
+local function httpGet(url)
+	if type(game.HttpGet) == "function" then
+		local ok, res = pcall(function() return game:HttpGet(url) end)
+		if ok and res then return res end
+	end
+	if type(request) == "function" then
+		local ok, res = pcall(request, { Url = url, Method = "GET" })
+		if ok and res and res.Body then return res.Body end
+	end
+	return nil
+end
+
+local function httpJson(url)
+	local raw = httpGet(url)
+	if not raw then return nil end
+	local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
+	return ok and data or nil
+end
+
 ----------------------------------------------------
 -- PLATFORM
 ----------------------------------------------------
@@ -97,7 +128,7 @@ local infZoomActive = false
 local animalEspActive = false
 local animalEspHealth = false
 local ANIMAL_ESP_DISTANCE = 650
-local animalIgnore = {}       -- [animalName] = true
+local animalIgnore = {}
 
 local espTeamColors = false
 local espShowHealth = false
@@ -106,17 +137,17 @@ local espFriendsOnly = false
 local walkSpeedValue = 16
 local walkBoostActive = false
 
-local selectedAbility = nil
-local selectedPlayer = nil
 local changeValueMode = "add"
+local minimizeScale = 100
+local keybindsEnabled = true
 
 local uiRefs = { goToPage = nil, minimized = false, gui = nil, cancelBuild = nil }
 local currentPageName = "General"
 
 ----------------------------------------------------
--- THEME  (live-editable)
+-- THEME  (fully editable)
 ----------------------------------------------------
-local T = {
+local THEME_DEFAULTS = {
 	Bg1    = Color3.fromRGB(30, 22, 70),
 	Bg2    = Color3.fromRGB(6, 6, 14),
 	Panel  = Color3.fromRGB(20, 26, 60),
@@ -132,6 +163,16 @@ local T = {
 	Bad    = Color3.fromRGB(255, 95, 115),
 	Warn   = Color3.fromRGB(255, 205, 90),
 }
+local THEME_LABELS = {
+	{ "Accent", "Accent" }, { "Accent 2", "Accent2" }, { "Text", "Text" }, { "Dimmed Text", "Dim" },
+	{ "Stroke / Outline", "Stroke" }, { "Panel", "Panel" }, { "Panel Dark", "PanelD" },
+	{ "Hover", "Hover" }, { "Text Field", "Field" },
+	{ "Background Top", "Bg1" }, { "Background Bottom", "Bg2" },
+	{ "Good", "Good" }, { "Bad", "Bad" }, { "Warning", "Warn" },
+}
+
+local T = {}
+for k, v in pairs(THEME_DEFAULTS) do T[k] = v end
 
 local themeRegistry = {}
 for k in pairs(T) do themeRegistry[k] = {} end
@@ -185,6 +226,8 @@ end
 -- UI HELPERS
 ----------------------------------------------------
 local LOGO_ID = "rbxassetid://8498174594"
+local KEYBIND_IMG = "rbxassetid://126810011338788"
+local VERSION = "v2.1.4"
 
 local function make(class, props, parent)
 	local i = Instance.new(class)
@@ -199,6 +242,14 @@ local function stroke(i, col, tr, th)
 	s.Thickness = th or 1; s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border; s.Parent = i
 	trackTheme(s)
 	return s
+end
+local function newViewportCamera(parent)
+	-- CameraType must be Scriptable, otherwise a viewport camera can hijack the mouse
+	local cam = Instance.new("Camera")
+	cam.CameraType = Enum.CameraType.Scriptable
+	cam.FieldOfView = 70
+	cam.Parent = parent
+	return cam
 end
 local function playClick()
 	local s = Instance.new("Sound"); s.SoundId = "rbxassetid://83374956945112"; s.Volume = 0.2
@@ -241,12 +292,54 @@ local function ripple(btn)
 end
 
 ----------------------------------------------------
+-- KEYBIND REGISTRY
+----------------------------------------------------
+local keybinds = {}       -- [action] = Enum.KeyCode
+local keyTriggers = {}    -- [action] = function
+local keyRefs = {}        -- [action] = { btn = TextButton }
+local listeningAction = nil
+local panelSyncers = {}
+
+local function syncPanels()
+	for _, f in ipairs(panelSyncers) do pcall(f) end
+end
+
+local function refreshKeyVisual(action)
+	local ref = keyRefs[action]
+	if not ref or not ref.btn or not ref.btn.Parent then return end
+	local key = keybinds[action]
+	if key and key ~= Enum.KeyCode.Unknown then
+		ref.btn.Image = KEYBIND_IMG
+		ref.btn.ImageTransparency = 0
+		ref.btn.Text = key.Name
+		ref.btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+		ref.btn.BackgroundTransparency = 1
+	else
+		ref.btn.Image = ""
+		ref.btn.Text = "+"
+		ref.btn.TextColor3 = T.Accent
+		ref.btn.BackgroundTransparency = 0
+	end
+end
+
+local function refreshAllKeyVisuals()
+	for act in pairs(keyRefs) do refreshKeyVisual(act) end
+end
+
+local function beginListen(action)
+	listeningAction = action
+	local ref = keyRefs[action]
+	if ref and ref.btn then ref.btn.Text = "..." end
+	showNotification("Press a key to bind: " .. action .. "   (Backspace clears)", 2.2)
+end
+
+----------------------------------------------------
 -- BUILDER STATE
 ----------------------------------------------------
 local buildState = {
 	SelectedAxis = "Y",
 	Rotation = Vector3.new(0, 0, 0),
-	AxisOffset = { X = 0, Y = 0, Z = 0 },   -- per-axis AND all applied together
+	AxisOffset = { X = 0, Y = 0, Z = 0 },
 	StructureName = "Shelter",
 	IsConstructing = false,
 	BoundingBoxPart = nil,
@@ -267,12 +360,10 @@ local function findStructureModel(parent, modelName)
 	return nil
 end
 
--- hardened: no more indexing Assets.Structures when it doesn't exist
 local function getStructureByName(modelName)
 	if not modelName or modelName == "" then return nil end
 	local assets = ReplicatedStorage:FindFirstChild("Assets")
 	if not assets then return nil end
-
 	local roots = {}
 	local structures = assets:FindFirstChild("Structures")
 	if structures then
@@ -282,7 +373,6 @@ local function getStructureByName(modelName)
 	end
 	local itemModels = assets:FindFirstChild("ItemModels")
 	if itemModels then table.insert(roots, itemModels) end
-
 	for _, root in ipairs(roots) do
 		local found = findStructureModel(root, modelName)
 		if found then return found end
@@ -334,7 +424,6 @@ local function setupAllItemsAsThrowables()
 
 	local itemModelsFolder = itemsFolder:FindFirstChild("ItemModels") or Instance.new("Folder", itemsFolder)
 	itemModelsFolder.Name = "ItemModels"
-
 	local throwablesFolder = itemModelsFolder:FindFirstChild("Throwables")
 	if not throwablesFolder then
 		throwablesFolder = Instance.new("Folder", itemModelsFolder)
@@ -408,7 +497,7 @@ local function groundSnap(pos, ignoreChar)
 end
 
 ----------------------------------------------------
--- FX / DAMAGE / NOTIFICATION
+-- FX / NOTIFICATION
 ----------------------------------------------------
 local function triggerMultiImpactFX(hitInstance, hitPos)
 	local targetCharacter = hitInstance and hitInstance:FindFirstAncestorOfClass("Model")
@@ -430,10 +519,10 @@ local function triggerMultiImpactFX(hitInstance, hitPos)
 end
 
 local function showNotification(message, duration)
-	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
-	local notifGui = playerGui:FindFirstChild("ProtectNotifGui") or Instance.new("ScreenGui", playerGui)
+	local notifGui = UI_PARENT:FindFirstChild("ProtectNotifGui") or Instance.new("ScreenGui", UI_PARENT)
 	notifGui.Name = "ProtectNotifGui"
 	notifGui.ResetOnSpawn = false
+	notifGui.DisplayOrder = 200
 	notifGui:ClearAllChildren()
 
 	local popSound = Instance.new("Sound", notifGui)
@@ -449,9 +538,9 @@ local function showNotification(message, duration)
 	frame.ClipsDescendants = true
 
 	local st = Instance.new("UIStroke", frame)
-	st.Color = Color3.fromRGB(140, 170, 255); st.Thickness = 1.5; st.Transparency = 1
+	st.Color = T.Accent; st.Thickness = 1.5; st.Transparency = 1
 	local grad = Instance.new("UIGradient", frame)
-	grad.Color = ColorSequence.new(Color3.fromRGB(30, 22, 70), Color3.fromRGB(10, 10, 20)); grad.Rotation = 135
+	grad.Color = ColorSequence.new(T.Bg1, T.Bg2); grad.Rotation = 135
 	Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
 
 	local label = Instance.new("TextLabel", frame)
@@ -476,7 +565,7 @@ local function showNotification(message, duration)
 end
 
 ----------------------------------------------------
--- ESP (players + animals)
+-- ESP
 ----------------------------------------------------
 local espFriendCache = {}
 local function isFriend(plr)
@@ -503,7 +592,7 @@ local function createBillboard(character, tag)
 	textLabel.Size = UDim2.new(1, 0, 1, 0)
 	textLabel.BackgroundTransparency = 1
 	textLabel.Text = ""
-	textLabel.TextColor3 = Color3.fromRGB(140, 175, 255)
+	textLabel.TextColor3 = T.Accent
 	textLabel.TextStrokeTransparency = 0
 	textLabel.Font = Enum.Font.GothamBold
 	textLabel.TextSize = 12
@@ -527,21 +616,7 @@ local function removeESP(character, tag)
 	if character:FindFirstChild(tag .. "_Billboard") then character[tag .. "_Billboard"]:Destroy() end
 end
 
-local function clearAllESP()
-	for _, plr in ipairs(Players:GetPlayers()) do
-		if plr.Character then removeESP(plr.Character, "PlayerESP") end
-	end
-	local folder = Workspace:FindFirstChild("Animals")
-	local scan = folder or Workspace
-	for _, d in ipairs(scan:GetDescendants()) do
-		if d:IsA("Model") and d:FindFirstChildOfClass("Humanoid") then removeESP(d, "AnimalESP") end
-	end
-end
-
--- animal helpers
-local function getAnimalFolder()
-	return Workspace:FindFirstChild("Animals")
-end
+local function getAnimalFolder() return Workspace:FindFirstChild("Animals") end
 
 local function getAnimalGroups()
 	local folder = getAnimalFolder()
@@ -674,7 +749,7 @@ local function spawnTracer(a, b)
 	part.Name = "SpearTracer"
 	part.Anchored = true; part.CanCollide = false; part.CanQuery = false; part.CastShadow = false
 	part.Material = Enum.Material.Neon
-	part.Color = Color3.fromRGB(140, 175, 255)
+	part.Color = T.Accent
 	part.Transparency = 0.25
 	part.Size = Vector3.new(0.12, 0.12, d)
 	part.CFrame = CFrame.lookAt(a + (b - a) / 2, b)
@@ -728,7 +803,7 @@ if ThrownSpearReplication and killConnections(ThrownSpearReplication.OnClientEve
 end
 
 ----------------------------------------------------
--- RUNTIME STATE / CONFIG TABLES
+-- RUNTIME CONFIG TABLES
 ----------------------------------------------------
 local throwEnabled   = false
 local throwCount     = 1
@@ -750,11 +825,7 @@ local spreadCfg     = { Range = 60, CustomItem = "", TargetPlayers = false, Dura
 local spreadAttack  = { Active = false, Walk = nil, Jump = nil, JumpH = nil }
 local spreadToggleRef = nil
 
-local keybinds, keyTriggers, keyRefs = {}, {}, {}
 local toggleRefs = {}
-local listeningAction = nil
-
-local settingsCfg = { RelaunchOnRejoin = false, AutoSave = true, LastPlaceId = 0, LastJobId = "" }
 
 local function getCamera() return Workspace.CurrentCamera end
 
@@ -769,7 +840,7 @@ local function getThumb(plr)
 end
 
 ----------------------------------------------------
--- CONFIG SAVE / LOAD (writefile / readfile / delfile)
+-- CONFIG  (keybinds + theme ONLY)
 ----------------------------------------------------
 local SAVE_FOLDER = "LunarMenu"
 local SAVE_FILE = SAVE_FOLDER .. "/config.json"
@@ -785,7 +856,6 @@ local function setDirty(v)
 	pcall(onDirtyChanged)
 end
 
--- only create the folder if it genuinely doesn't exist yet
 local function ensureSaveFolder()
 	if type(isfolder) ~= "function" or type(makefolder) ~= "function" then return false end
 	local ok, exists = pcall(isfolder, SAVE_FOLDER)
@@ -800,88 +870,33 @@ local function fileExists(path)
 	return ok and res == true
 end
 
-local function resolveSavePath()
-	if ensureSaveFolder() then return SAVE_FILE end
-	return FALLBACK_FILE
-end
-
 local function buildConfigTable()
 	local kb = {}
 	for act, key in pairs(keybinds) do kb[act] = key.Name end
 	local th = {}
 	for k, c in pairs(T) do th[k] = { c.R, c.G, c.B } end
-	local ignored = {}
-	for n, v in pairs(animalIgnore) do if v then table.insert(ignored, n) end end
-
-	return {
-		keybinds = kb,
-		theme = th,
-		settings = {
-			RelaunchOnRejoin = settingsCfg.RelaunchOnRejoin,
-			AutoSave = settingsCfg.AutoSave,
-			LastPlaceId = settingsCfg.LastPlaceId,
-			LastJobId = settingsCfg.LastJobId,
-		},
-		state = {
-			throwable = currentThrowableName,
-			walkSpeed = walkSpeedValue,
-			espDist = MAX_ESP_DISTANCE,
-			animalDist = ANIMAL_ESP_DISTANCE,
-			espTeamColors = espTeamColors,
-			espShowHealth = espShowHealth,
-			espFriendsOnly = espFriendsOnly,
-			animalEspHealth = animalEspHealth,
-			animalIgnore = ignored,
-			build = {
-				AxisOffset = { X = buildState.AxisOffset.X, Y = buildState.AxisOffset.Y, Z = buildState.AxisOffset.Z },
-				Rotation = { X = buildState.Rotation.X, Y = buildState.Rotation.Y, Z = buildState.Rotation.Z },
-				StructureName = buildState.StructureName,
-			},
-			spread = { Range = spreadCfg.Range, CustomItem = spreadCfg.CustomItem,
-				TargetPlayers = spreadCfg.TargetPlayers, Duration = spreadCfg.Duration },
-			protect = { Radius = protectExtras.Radius, Interval = protectExtras.Interval,
-				CustomItem = protectExtras.CustomItem, Count = protectExtras.Count, Delay = protectExtras.Delay },
-			line = { Range = lineCfg.Range, PerStuds = lineCfg.PerStuds,
-				GroundSnap = lineCfg.GroundSnap, CustomStructure = lineCfg.CustomStructure },
-			trap = { Amount = trapCfg.Amount, CustomStructure = trapCfg.CustomStructure,
-				Target = type(trapCfg.Target) == "string" and trapCfg.Target or "all" },
-			concurrent = { Spacing = concurrent.Spacing, MaxRange = concurrent.MaxRange,
-				PerStuds = concurrent.PerStuds, GroundSnap = concurrent.GroundSnap },
-			throwCount = throwCount, throwDelay = throwDelay, throwShape = throwShape,
-			flags = {
-				esp = playerEspActive, fullbright = fullBrightActive, firstPerson = firstPersonActive,
-				infZoom = infZoomActive, walkBoost = walkBoostActive, animalEsp = animalEspActive,
-				protect = protectModeActive, throw = throwEnabled,
-			},
-		},
-	}
+	return { keybinds = kb, theme = th }
 end
 
 local function writeConfigToDisk()
 	if not HAS_FS then return false end
 	local ok, encoded = pcall(function() return HttpService:JSONEncode(buildConfigTable()) end)
 	if not ok or not encoded then return false end
-
-	local target = resolveSavePath()
-	local wrote = pcall(function()
-		if fileExists(target) then
-			writefile(target, encoded)
-		else
-			writefile(target, encoded)
-		end
-	end)
-
-	if not wrote then
-		wrote = pcall(function() writefile(FALLBACK_FILE, encoded) end)
+	local target = SAVE_FILE
+	if ensureSaveFolder() then
+		target = SAVE_FILE
+	else
+		target = FALLBACK_FILE
 	end
+	local wrote = pcall(function() writefile(target, encoded) end)
+	if not wrote then wrote = pcall(function() writefile(FALLBACK_FILE, encoded) end) end
 	return wrote and true or false
 end
 
--- saveConfig(force): force = true ignores the Auto Save setting (used by the Save button)
 local function saveConfig(force)
 	if not HAS_FS then return end
 	setDirty(true)
-	if not force and not settingsCfg.AutoSave then return end
+	if not force and not keybindsEnabled and false then end -- placeholder (settings not persisted)
 	if saveQueued then return end
 	saveQueued = true
 	task.delay(0.6, function()
@@ -891,22 +906,18 @@ local function saveConfig(force)
 	end)
 end
 
-local function readConfigFile()
-	if not HAS_FS then return nil end
+local function loadConfig()
+	if not HAS_FS then return end
+	local data
 	for _, path in ipairs({ SAVE_FILE, FALLBACK_FILE }) do
 		if fileExists(path) then
 			local ok, raw = pcall(readfile, path)
 			if ok and raw and raw ~= "" then
-				local decoded, data = pcall(function() return HttpService:JSONDecode(raw) end)
-				if decoded and type(data) == "table" then return data end
+				local decoded, d = pcall(function() return HttpService:JSONDecode(raw) end)
+				if decoded and type(d) == "table" then data = d; break end
 			end
 		end
 	end
-	return nil
-end
-
-local function loadConfig()
-	local data = readConfigFile()
 	if type(data) ~= "table" then return end
 
 	if type(data.keybinds) == "table" then
@@ -915,7 +926,6 @@ local function loadConfig()
 			if kc then keybinds[act] = kc end
 		end
 	end
-
 	if type(data.theme) == "table" then
 		for k, rgb in pairs(data.theme) do
 			if T[k] and type(rgb) == "table" and #rgb >= 3 then
@@ -923,113 +933,12 @@ local function loadConfig()
 			end
 		end
 	end
-
-	local s = data.settings
-	if type(s) == "table" then
-		settingsCfg.RelaunchOnRejoin = s.RelaunchOnRejoin == true
-		if s.AutoSave ~= nil then settingsCfg.AutoSave = s.AutoSave ~= false end
-		settingsCfg.LastPlaceId = tonumber(s.LastPlaceId) or 0
-		settingsCfg.LastJobId = tostring(s.LastJobId or "")
-	end
-
-	local st = data.state
-	if type(st) == "table" then
-		currentThrowableName = st.throwable or currentThrowableName
-		walkSpeedValue = tonumber(st.walkSpeed) or walkSpeedValue
-		MAX_ESP_DISTANCE = tonumber(st.espDist) or MAX_ESP_DISTANCE
-		ANIMAL_ESP_DISTANCE = tonumber(st.animalDist) or ANIMAL_ESP_DISTANCE
-		espTeamColors = st.espTeamColors == true
-		espShowHealth = st.espShowHealth == true
-		espFriendsOnly = st.espFriendsOnly == true
-		animalEspHealth = st.animalEspHealth == true
-		if type(st.animalIgnore) == "table" then
-			for _, n in ipairs(st.animalIgnore) do animalIgnore[n] = true end
-		end
-
-		-- builder offsets: restore every axis that was modified
-		local bd = st.build
-		if type(bd) == "table" then
-			local ao = bd.AxisOffset
-			if type(ao) == "table" then
-				buildState.AxisOffset.X = tonumber(ao.X) or 0
-				buildState.AxisOffset.Y = tonumber(ao.Y) or 0
-				buildState.AxisOffset.Z = tonumber(ao.Z) or 0
-			end
-			local rt = bd.Rotation
-			if type(rt) == "table" then
-				buildState.Rotation = Vector3.new(
-					tonumber(rt.X) or 0, tonumber(rt.Y) or 0, tonumber(rt.Z) or 0)
-			end
-			if type(bd.StructureName) == "string" and bd.StructureName ~= "" then
-				buildState.StructureName = bd.StructureName
-			end
-		end
-
-		local sp = st.spread
-		if type(sp) == "table" then
-			spreadCfg.Range = tonumber(sp.Range) or spreadCfg.Range
-			spreadCfg.CustomItem = sp.CustomItem or spreadCfg.CustomItem
-			spreadCfg.TargetPlayers = sp.TargetPlayers == true
-			spreadCfg.Duration = tonumber(sp.Duration) or spreadCfg.Duration
-		end
-		local pr = st.protect
-		if type(pr) == "table" then
-			protectExtras.Radius = tonumber(pr.Radius) or protectExtras.Radius
-			protectExtras.Interval = tonumber(pr.Interval) or protectExtras.Interval
-			protectExtras.CustomItem = pr.CustomItem or protectExtras.CustomItem
-			protectExtras.Count = tonumber(pr.Count) or protectExtras.Count
-			protectExtras.Delay = tonumber(pr.Delay) or protectExtras.Delay
-		end
-		local ln = st.line
-		if type(ln) == "table" then
-			lineCfg.Range = tonumber(ln.Range) or lineCfg.Range
-			lineCfg.PerStuds = tonumber(ln.PerStuds) or lineCfg.PerStuds
-			lineCfg.GroundSnap = ln.GroundSnap ~= false
-			lineCfg.CustomStructure = ln.CustomStructure or lineCfg.CustomStructure
-		end
-		local tr = st.trap
-		if type(tr) == "table" then
-			trapCfg.Amount = tonumber(tr.Amount) or trapCfg.Amount
-			trapCfg.CustomStructure = tr.CustomStructure or trapCfg.CustomStructure
-			trapCfg.Target = tr.Target or trapCfg.Target
-		end
-		local cc = st.concurrent
-		if type(cc) == "table" then
-			concurrent.Spacing = tonumber(cc.Spacing) or concurrent.Spacing
-			concurrent.MaxRange = tonumber(cc.MaxRange) or concurrent.MaxRange
-			concurrent.PerStuds = tonumber(cc.PerStuds) or concurrent.PerStuds
-			concurrent.GroundSnap = cc.GroundSnap ~= false
-		end
-		throwCount = tonumber(st.throwCount) or throwCount
-		throwDelay = tonumber(st.throwDelay) or throwDelay
-		throwShape = st.throwShape or throwShape
-		local fl = st.flags
-		if type(fl) == "table" then
-			playerEspActive = fl.esp == true
-			fullBrightActive = fl.fullbright == true
-			firstPersonActive = fl.firstPerson == true
-			infZoomActive = fl.infZoom == true
-			walkBoostActive = fl.walkBoost == true
-			animalEspActive = fl.animalEsp == true
-			protectModeActive = fl.protect == true
-			throwEnabled = fl.throw == true
-		end
-	end
 end
 
 pcall(loadConfig)
 
--- rejoin detection (compare against previous session)
-local wasRejoin = settingsCfg.RelaunchOnRejoin
-	and settingsCfg.LastPlaceId == game.PlaceId
-	and settingsCfg.LastJobId ~= ""
-	and settingsCfg.LastJobId ~= game.JobId
-
-settingsCfg.LastPlaceId = game.PlaceId
-settingsCfg.LastJobId = game.JobId
-
 ----------------------------------------------------
--- STARTUP FLAG APPLY
+-- STARTUP FLAGS
 ----------------------------------------------------
 local function applyStartupFlags()
 	if fullBrightActive then
@@ -1197,7 +1106,7 @@ local function throwAt(targetPos, hitInstance, countOverride, itemOverride, dela
 end
 
 ----------------------------------------------------
--- GLOBAL INPUT (click to throw / wellness pick / middle mouse multiline)
+-- GLOBAL INPUT
 ----------------------------------------------------
 UserInputService.InputBegan:Connect(function(input, gp)
 	if gp then return end
@@ -1250,19 +1159,17 @@ task.spawn(function()
 end)
 
 ----------------------------------------------------
--- LOADING SCREEN — compact centered card, not full screen (10-14s)
+-- LOADING SCREEN
 ----------------------------------------------------
 local function showLoadingScreen(onDone)
-	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
-	local old = playerGui:FindFirstChild("LunarLoading"); if old then old:Destroy() end
+	local old = UI_PARENT:FindFirstChild("LunarLoading"); if old then old:Destroy() end
 
 	local sg = make("ScreenGui", { Name = "LunarLoading", ResetOnSpawn = false,
-		IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 100 }, playerGui)
+		IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 100 }, UI_PARENT)
 
 	local WHITE = Color3.new(1, 1, 1)
-	local duration = 10 + math.random() * 4
+	local duration = 9 + math.random() * 3
 
-	-- finish guard: runs once, always runs
 	local done = false
 	local function finish()
 		if done then return end
@@ -1294,7 +1201,6 @@ local function showLoadingScreen(onDone)
 		{ Position = UDim2.new(0.5, 0, 0.5, 0) })
 
 	local fadeList = {}
-
 	local rings = {}
 	for i, cfg in ipairs({ { 76, 6.0, T.Accent }, { 104, -4.0, T.Accent2 } }) do
 		local size = cfg[1]
@@ -1319,7 +1225,6 @@ local function showLoadingScreen(onDone)
 	local title = make("TextLabel", { Size = UDim2.new(1, 0, 0, 26), Position = UDim2.new(0, 0, 0, 92),
 		BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "L U N A R", TextColor3 = WHITE,
 		TextSize = 22, TextTransparency = 1, ZIndex = 4 }, card)
-	themeGradient(title, "Accent", "Accent2")
 
 	local status = make("TextLabel", { Size = UDim2.new(1, 0, 0, 16), Position = UDim2.new(0, 0, 0, 120),
 		BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, Text = "Initializing...", TextColor3 = WHITE,
@@ -1340,8 +1245,8 @@ local function showLoadingScreen(onDone)
 		TextSize = 10, TextTransparency = 1, ZIndex = 4 }, card)
 
 	local credit = make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), Position = UDim2.new(0, 0, 0, 198),
-		BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, Text = "developed by v3x", TextColor3 = WHITE,
-		TextSize = 9, TextTransparency = 1, ZIndex = 4 }, card)
+		BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, Text = "developed by v3x  •  " .. VERSION,
+		TextColor3 = WHITE, TextSize = 9, TextTransparency = 1, ZIndex = 4 }, card)
 
 	fadeList = {
 		{ title, "TextTransparency" }, { status, "TextTransparency" }, { percent, "TextTransparency" },
@@ -1359,13 +1264,10 @@ local function showLoadingScreen(onDone)
 		while sg.Parent do
 			local dt = RunService.RenderStepped:Wait()
 			for _, r in ipairs(rings) do
-				if r.ring.Parent then
-					r.ring.Rotation = (r.ring.Rotation + r.speed * dt) % 360
-				end
+				if r.ring.Parent then r.ring.Rotation = (r.ring.Rotation + r.speed * dt) % 360 end
 			end
 		end
 	end)
-
 	task.spawn(function()
 		while sg.Parent do
 			tween(logoGlow, TweenInfo.new(1.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
@@ -1376,7 +1278,6 @@ local function showLoadingScreen(onDone)
 			task.wait(1.6)
 		end
 	end)
-
 	task.spawn(function()
 		while sg.Parent do
 			shimmer.Position = UDim2.new(0, -50, 0, 0)
@@ -1386,14 +1287,9 @@ local function showLoadingScreen(onDone)
 	end)
 
 	local stages = {
-		{ 0.00, "Fetching Modules..." },
-		{ 0.15, "Resolving Remotes..." },
-		{ 0.30, "Applying Hooks..." },
-		{ 0.48, "Loading Item Stats..." },
-		{ 0.63, "Indexing Throwables..." },
-		{ 0.78, "Building Interface..." },
-		{ 0.90, "Loading UI..." },
-		{ 0.97, "Ready" },
+		{ 0.00, "Fetching Modules..." }, { 0.15, "Resolving Remotes..." }, { 0.30, "Applying Hooks..." },
+		{ 0.48, "Loading Item Stats..." }, { 0.63, "Indexing Throwables..." },
+		{ 0.78, "Building Interface..." }, { 0.90, "Loading UI..." }, { 0.97, "Ready" },
 	}
 	local lastStage = 0
 
@@ -1419,14 +1315,10 @@ local function showLoadingScreen(onDone)
 				if a >= 1 then break end
 				RunService.RenderStepped:Wait()
 			end
-
 			status.Text = "Ready"
 			tween(status, TweenInfo.new(0.3), { TextTransparency = 0 })
 			task.wait(0.45)
-
-			for _, e in ipairs(fadeList) do
-				tween(e[1], TweenInfo.new(0.45), { [e[2]] = 1 })
-			end
+			for _, e in ipairs(fadeList) do tween(e[1], TweenInfo.new(0.45), { [e[2]] = 1 }) end
 			for _, r in ipairs(rings) do
 				tween(r.ring, TweenInfo.new(0.45), { BackgroundTransparency = 1 })
 				tween(r.stroke, TweenInfo.new(0.45), { Transparency = 1 })
@@ -1448,20 +1340,19 @@ end
 --=====================================================================
 local createMasterUI
 createMasterUI = function()
-	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
-	if playerGui:FindFirstChild("MasterControlGui") then playerGui.MasterControlGui:Destroy() end
-
+	if UI_PARENT:FindFirstChild("MasterControlGui") then UI_PARENT.MasterControlGui:Destroy() end
 	for k in pairs(themeRegistry) do themeRegistry[k] = {} end
+	keyRefs = {}
+	panelSyncers = {}
 
 	local gui = make("ScreenGui", { Name = "MasterControlGui", ResetOnSpawn = false,
-		IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling }, playerGui)
+		IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 10 }, UI_PARENT)
 	uiRefs.gui = gui
 
 	local currentNormal = UDim2.new(0, 700, 0, 470)
-	local MINIMIZED = UDim2.new(0, 170, 0, 44)
 
 	local glow = make("Frame", { Size = currentNormal, Position = UDim2.new(0.5, -350, 0.5, -235),
-		BackgroundColor3 = Color3.fromRGB(70, 90, 220), BackgroundTransparency = 0.72, BorderSizePixel = 0, ZIndex = 0 }, gui)
+		BackgroundColor3 = T.Accent, BackgroundTransparency = 0.78, BorderSizePixel = 0, ZIndex = 0 }, gui)
 	corner(glow, 18)
 
 	local main = make("Frame", { Size = currentNormal, Position = UDim2.new(0.5, -350, 0.5, -235),
@@ -1473,22 +1364,25 @@ createMasterUI = function()
 	local sheenHolder = make("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, ClipsDescendants = true, ZIndex = 2 }, main)
 	corner(sheenHolder, 14)
 	local sheen = make("Frame", { Size = UDim2.new(0, 160, 1.6, 0), Position = UDim2.new(0, -200, -0.3, 0),
-		BackgroundColor3 = Color3.fromRGB(255, 255, 255), BackgroundTransparency = 0.9, BorderSizePixel = 0, Rotation = 18, ZIndex = 2 }, sheenHolder)
-	make("UIGradient", { Color = ColorSequence.new(Color3.fromRGB(255,255,255), Color3.fromRGB(255,255,255)),
-		Transparency = NumberSequence.new({
-			NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0.35), NumberSequenceKeypoint.new(1, 1)
-		}) }, sheen)
+		BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.9, BorderSizePixel = 0, Rotation = 18, ZIndex = 2 }, sheenHolder)
+	make("UIGradient", { Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0.35), NumberSequenceKeypoint.new(1, 1)
+	}) }, sheen)
 
 	local scan = make("Frame", { Size = UDim2.new(1, -20, 0, 2), Position = UDim2.new(0, 10, 0, 46),
 		BackgroundColor3 = T.Accent2, BackgroundTransparency = 0.75, BorderSizePixel = 0, ZIndex = 3 }, main)
 
 	for _, pos in ipairs({ UDim2.new(0, 6, 1, -22), UDim2.new(1, -22, 1, -22) }) do
 		local b = make("Frame", { Size = UDim2.new(0, 16, 0, 16), Position = pos, BackgroundTransparency = 1, ZIndex = 4 }, main)
-		local s = stroke(b, T.Accent, 0.35, 2)
-		s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+		stroke(b, T.Accent, 0.35, 2)
 	end
 
-	local tooltip = make("TextLabel", { Size = UDim2.new(0, 120, 0, 22), BackgroundColor3 = Color3.fromRGB(18, 22, 45),
+	-- minimised logo (square mode)
+	local miniLogo = make("ImageLabel", { Size = UDim2.new(1, -14, 1, -14), AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 0), BackgroundTransparency = 1, Image = LOGO_ID,
+		Visible = false, ZIndex = 7 }, main)
+
+	local tooltip = make("TextLabel", { Size = UDim2.new(0, 120, 0, 22), BackgroundColor3 = T.Panel,
 		BackgroundTransparency = 0.05, BorderSizePixel = 0, Font = Enum.Font.Gotham, Text = "",
 		TextColor3 = T.Text, TextSize = 10, Visible = false, ZIndex = 95, TextTransparency = 1 }, gui)
 	corner(tooltip, 6); stroke(tooltip, T.Accent, 0.25)
@@ -1515,30 +1409,40 @@ createMasterUI = function()
 		obj.InputEnded:Connect(function(i) if i.UserInputType == Enum.UserInputType.Touch then hide() end end)
 	end
 
+	------------------------------------------------
+	-- TITLE BAR
+	------------------------------------------------
 	local titleBar = make("Frame", { Size = UDim2.new(1, 0, 0, 46), BackgroundTransparency = 1, ZIndex = 5 }, main)
 	local titleLogo = make("ImageLabel", { Size = UDim2.new(0, 26, 0, 26), Position = UDim2.new(0, 18, 0.5, -13),
 		BackgroundTransparency = 1, Image = LOGO_ID, ZIndex = 5 }, titleBar)
-	local titleLbl = make("TextLabel", { Size = UDim2.new(1, -220, 1, 0), Position = UDim2.new(0, 50, 0, 0),
-		BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "Lunar", TextColor3 = T.Text, TextSize = 15,
-		TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5 }, titleBar)
-	themeGradient(titleLbl, "Accent", "Accent2")
+	local titleLbl = make("TextLabel", { Size = UDim2.new(0, 52, 1, 0), Position = UDim2.new(0, 50, 0, 0),
+		BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "Lunar", TextColor3 = T.Accent,
+		TextSize = 15, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5 }, titleBar)
+	local versionLbl = make("TextLabel", { Size = UDim2.new(0, 44, 1, 0), Position = UDim2.new(0, 104, 0, 1),
+		BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = VERSION, TextColor3 = T.Dim,
+		TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 5 }, titleBar)
 
-	-- close (X) right next to the Lunar text
-	local closeBtn = make("TextButton", { Size = UDim2.new(0, 22, 0, 22), Position = UDim2.new(0, 94, 0.5, -11),
+	local userThumb = make("ImageLabel", { Size = UDim2.new(0, 20, 0, 20), Position = UDim2.new(0, 150, 0.5, -10),
+		BackgroundColor3 = T.PanelD, Image = getThumb(LocalPlayer) or "", ZIndex = 5 }, titleBar)
+	corner(userThumb, 999); stroke(userThumb, T.Stroke, 0.5)
+	local userLbl = make("TextLabel", { Size = UDim2.new(0, 130, 1, 0), Position = UDim2.new(0, 176, 0, 0),
+		BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, Text = "@" .. LocalPlayer.Name,
+		TextColor3 = T.Dim, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 5 }, titleBar)
+
+	local closeBtn = make("TextButton", { Size = UDim2.new(0, 22, 0, 22), Position = UDim2.new(0, 18, 0, 46 + 6),
 		BackgroundColor3 = Color3.fromRGB(70, 40, 55), Font = Enum.Font.GothamBold, Text = "✕",
-		TextColor3 = T.Text, TextSize = 12, AutoButtonColor = false, ZIndex = 6 }, titleBar)
-	corner(closeBtn, 6); stroke(closeBtn, T.Bad, 0.5); hover(closeBtn, Color3.fromRGB(70, 40, 55), Color3.fromRGB(150, 55, 70))
-	addTooltip(closeBtn, "Close menu and disable everything")
+		TextColor3 = T.Text, TextSize = 12, AutoButtonColor = false, ZIndex = 6, Visible = false }, main)
 
 	local platTag = make("TextLabel", { Size = UDim2.new(0, 54, 0, 16), Position = UDim2.new(1, -140, 0.5, -8),
-		BackgroundColor3 = Color3.fromRGB(30, 40, 85), Font = Enum.Font.GothamBold, Text = IS_MOBILE and "MOBILE" or "PC",
+		BackgroundColor3 = T.PanelD, Font = Enum.Font.GothamBold, Text = IS_MOBILE and "MOBILE" or "PC",
 		TextColor3 = T.Accent, TextSize = 9, ZIndex = 5 }, titleBar)
 	corner(platTag, 6); stroke(platTag, T.Stroke, 0.5)
 
 	local minBtn = make("TextButton", { Size = UDim2.new(0, 32, 0, 32), Position = UDim2.new(1, -42, 0.5, -16),
-		BackgroundColor3 = Color3.fromRGB(30, 40, 85), Font = Enum.Font.GothamBold, Text = "-",
+		BackgroundColor3 = T.PanelD, Font = Enum.Font.GothamBold, Text = "-",
 		TextColor3 = T.Text, TextSize = 16, AutoButtonColor = false, ZIndex = 6 }, titleBar)
-	corner(minBtn, 9); stroke(minBtn, T.Stroke, 0.4); hover(minBtn, Color3.fromRGB(30, 40, 85), T.Hover)
+	corner(minBtn, 9); stroke(minBtn, T.Stroke, 0.4); hover(minBtn, T.PanelD, T.Hover)
 
 	local body = make("Frame", { Size = UDim2.new(1, 0, 1, -46), Position = UDim2.new(0, 0, 0, 46),
 		BackgroundTransparency = 1, ZIndex = 5 }, main)
@@ -1582,14 +1486,14 @@ createMasterUI = function()
 
 	local function styleField(box)
 		box.BackgroundColor3 = T.Field; box.TextColor3 = T.Text
-		box.PlaceholderColor3 = Color3.fromRGB(100, 120, 170)
+		box.PlaceholderColor3 = T.Dim
 		box.Font = Enum.Font.Gotham; box.TextSize = 11; box.ClearTextOnFocus = false
-		corner(box, 8); local s = stroke(box, Color3.fromRGB(60, 85, 160), 0.5)
+		corner(box, 8); local s = stroke(box, T.Stroke, 0.5)
 		box.Focused:Connect(function() TweenService:Create(s, TweenInfo.new(.2), { Color = T.Accent, Transparency = 0 }):Play() end)
-		box.FocusLost:Connect(function() TweenService:Create(s, TweenInfo.new(.2), { Color = Color3.fromRGB(60, 85, 160), Transparency = 0.5 }):Play() end)
+		box.FocusLost:Connect(function() TweenService:Create(s, TweenInfo.new(.2), { Color = T.Stroke, Transparency = 0.5 }):Play() end)
 	end
 
-	-- combined toggle + keybind:  [Label .......... [K]  (o) ]
+	-- [Label .......... [+]  (o) ]
 	local function createToggleKeybind(parent, label, initial, onChange, defaultKey, tip, register)
 		local row = make("TextButton", { Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = T.Panel, Text = "",
 			AutoButtonColor = false, ClipsDescendants = true }, parent)
@@ -1606,16 +1510,26 @@ createMasterUI = function()
 			BackgroundColor3 = Color3.fromRGB(200, 210, 235), BorderSizePixel = 0 }, track)
 		corner(knob, 99)
 
-		local keyText
+		local keyBtn
 		if not IS_MOBILE then
-			keyText = make("TextLabel", { Size = UDim2.new(0, 48, 0, 20), Position = UDim2.new(1, -102, 0.5, -10),
-				BackgroundColor3 = Color3.fromRGB(26, 32, 58), Font = Enum.Font.GothamBold,
-				Text = "[..]", TextColor3 = T.Accent, TextSize = 10, ZIndex = 3 }, row)
-			corner(keyText, 6); stroke(keyText, T.Stroke, 0.55)
-			local key = keybinds[label] or defaultKey
-			keybinds[label] = key
-			keyText.Text = "[" .. key.Name .. "]"
-			keyRefs[label] = keyText
+			keyBtn = make("TextButton", { Size = UDim2.new(0, 50, 0, 20), Position = UDim2.new(1, -104, 0.5, -10),
+				BackgroundColor3 = T.Field, Font = Enum.Font.GothamBold, Text = "+", TextColor3 = T.Accent,
+				TextSize = 9, AutoButtonColor = false, ZIndex = 3, ClipsDescendants = false,
+				TextStrokeTransparency = 0.55, TextStrokeColor3 = Color3.new(0, 0, 0) }, row)
+			corner(keyBtn, 5); stroke(keyBtn, T.Stroke, 0.55)
+			keybinds[label] = keybinds[label] or defaultKey or Enum.KeyCode.Unknown
+			keyRefs[label] = { btn = keyBtn }
+			refreshKeyVisual(label)
+
+			keyBtn.MouseButton1Down:Connect(function() ripple(keyBtn) end)
+			keyBtn.MouseButton1Click:Connect(function() playClick(); beginListen(label) end)
+			keyBtn.MouseButton2Click:Connect(function()
+				keybinds[label] = Enum.KeyCode.Unknown
+				refreshKeyVisual(label)
+				saveConfig()
+				showNotification("Cleared keybind: " .. label, 1.4)
+			end)
+			addTooltip(keyBtn, "Click to bind a key  •  Right-click to clear")
 		end
 
 		local state = initial
@@ -1649,26 +1563,16 @@ createMasterUI = function()
 
 		row.MouseButton1Down:Connect(function() ripple(row) end)
 		row.MouseButton1Click:Connect(function()
-			local mp = UserInputService:GetMouseLocation()
-			local localX = mp.X - row.AbsolutePosition.X
-			if keyText and localX >= row.AbsoluteSize.X - 106 and localX < row.AbsoluteSize.X - 56 then
-				listeningAction = label
-				keyText.Text = "[...]"; keyText.TextColor3 = T.Warn
-				showNotification("Press a key to bind: " .. label, 1.5)
-				playClick()
-			else
-				api.toggle()
+			if keyBtn then
+				local mp = UserInputService:GetMouseLocation()
+				local ap, as = keyBtn.AbsolutePosition, keyBtn.AbsoluteSize
+				if mp.X >= ap.X and mp.X <= ap.X + as.X and mp.Y >= ap.Y and mp.Y <= ap.Y + as.Y then return end
 			end
-		end)
-		row.MouseButton2Click:Connect(function()
-			if not keyText then return end
-			listeningAction = label
-			keyText.Text = "[...]"; keyText.TextColor3 = T.Warn
-			playClick()
+			api.toggle()
 		end)
 
 		if tip then addTooltip(row, tip) end
-		if keyText then keyTriggers[label] = api.toggle else keyTriggers[label] = api.toggle end
+		keyTriggers[label] = api.toggle
 		refresh(false)
 		if register ~= false then toggleRefs[label] = api end
 		return api
@@ -1694,10 +1598,10 @@ createMasterUI = function()
 		local track = make("TextButton", { Size = UDim2.new(1, 0, 0, 10), Position = UDim2.new(0, 0, 0, 26),
 			BackgroundColor3 = Color3.fromRGB(18, 22, 42), Text = "", AutoButtonColor = false,
 			Active = true, ClipsDescendants = false }, holder)
-		corner(track, 99); stroke(track, Color3.fromRGB(60, 80, 160), 0.5)
+		corner(track, 99); stroke(track, T.Stroke, 0.5)
 		local fill = make("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = T.Accent, BorderSizePixel = 0 }, track)
 		corner(fill, 99)
-		themeGradient(fill, Color3.fromRGB(60, 110, 255), "Accent2")
+		themeGradient(fill, "Accent", "Accent2")
 		local knobGlow = make("Frame", { Size = UDim2.new(0, 22, 0, 22), AnchorPoint = Vector2.new(0.5, 0.5),
 			Position = UDim2.new(1, 0, 0.5, 0), BackgroundColor3 = T.Accent, BackgroundTransparency = 0.7, BorderSizePixel = 0 }, fill)
 		corner(knobGlow, 99)
@@ -1717,7 +1621,7 @@ createMasterUI = function()
 		local sliding = false
 		local lockedScroll = nil
 
-		local function apply(v, instant)
+		local function apply(v)
 			value = math.clamp(v, minV, maxV)
 			if step and step > 0 then value = math.floor(value / step + 0.5) * step end
 			value = math.clamp(value, minV, maxV)
@@ -1729,7 +1633,7 @@ createMasterUI = function()
 		end
 
 		local function fromX(px)
-			apply(minV + math.clamp((px - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1) * (maxV - minV), true)
+			apply(minV + math.clamp((px - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1) * (maxV - minV))
 		end
 
 		track.InputBegan:Connect(function(i)
@@ -1756,9 +1660,9 @@ createMasterUI = function()
 				end
 			end
 		end)
-		valBox.FocusLost:Connect(function() apply(tonumber(valBox.Text) or value, false); saveConfig() end)
-		apply(default, true)
-		return { set = function(v) apply(v, false) end, get = function() return value end, holder = holder }
+		valBox.FocusLost:Connect(function() apply(tonumber(valBox.Text) or value); saveConfig() end)
+		apply(default)
+		return { set = function(v) apply(v) end, get = function() return value end, holder = holder }
 	end
 
 	local function createTextBox(parent, label, placeholder, default, onCommit, tip)
@@ -1775,7 +1679,7 @@ createMasterUI = function()
 	end
 
 	------------------------------------------------
-	-- DROPDOWN (supports keepOpen + colored entries)
+	-- DROPDOWN
 	------------------------------------------------
 	local function createDropdown(parent, title, entries, onSelect, opts)
 		opts = opts or {}
@@ -1796,7 +1700,7 @@ createMasterUI = function()
 		local listH = math.min(#entries * 30 + 12, 180)
 		local extraH = opts.extraHeight or 0
 		local contentBox = make("Frame", { Size = UDim2.new(1, 0, 0, listH + extraH + 16), Position = UDim2.new(0, 0, 0, 42),
-			BackgroundColor3 = Color3.fromRGB(12, 16, 32), BackgroundTransparency = 0.05, Visible = false }, container)
+			BackgroundColor3 = T.Bg2, BackgroundTransparency = 0.05, Visible = false }, container)
 		corner(contentBox, 9); stroke(contentBox, T.Accent, 0.45)
 
 		local list = make("ScrollingFrame", { Size = UDim2.new(1, -16, 0, listH), Position = UDim2.new(0, 8, 0, 8),
@@ -1804,7 +1708,7 @@ createMasterUI = function()
 			ScrollBarThickness = 3, ScrollBarImageColor3 = T.Accent }, contentBox)
 		make("UIListLayout", { Padding = UDim.new(0, 4) }, list)
 
-		local extraFrame, current, isOpen = nil, nil, false
+		local current, isOpen = nil, false
 		local api = {}
 		function api.setValue(v, text) current = v; valueLbl.Text = text or tostring(v) end
 		function api.get() return current end
@@ -1813,13 +1717,15 @@ createMasterUI = function()
 			isOpen = false; arrow.Text = "v"
 			local tw = TweenService:Create(container, TweenInfo.new(0.22, Enum.EasingStyle.Quad), { Size = UDim2.new(1, 0, 0, 38) })
 			tw:Play(); tw.Completed:Connect(function() if not isOpen then contentBox.Visible = false end end)
+			task.delay(0.36, syncPanels)
 		end
 		function api.setEntries(newEntries)
 			list:ClearAllChildren()
 			make("UIListLayout", { Padding = UDim.new(0, 4) }, list)
+			listH = math.min(#newEntries * 30 + 12, 180)
 			for idx, e in ipairs(newEntries) do
 				local row = make("TextButton", { Size = UDim2.new(1, 0, 0, 28), Position = UDim2.new(-0.3, 0, 0, 0),
-					BackgroundColor3 = Color3.fromRGB(18, 24, 48), Text = "", AutoButtonColor = false, ClipsDescendants = true }, list)
+					BackgroundColor3 = T.PanelD, Text = "", AutoButtonColor = false, ClipsDescendants = true }, list)
 				corner(row, 7)
 				local xOff = 10
 				if e.image then
@@ -1831,7 +1737,7 @@ createMasterUI = function()
 					BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, Text = e.text,
 					TextColor3 = e.color or T.Text, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
 					TextTruncate = Enum.TextTruncate.AtEnd }, row)
-				hover(row, Color3.fromRGB(18, 24, 48), T.Hover)
+				hover(row, T.PanelD, T.Hover)
 				TweenService:Create(row, TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out, 0, false, idx * 0.02),
 					{ Position = UDim2.new(0, 0, 0, 0) }):Play()
 				row.MouseButton1Down:Connect(function() ripple(row) end)
@@ -1840,6 +1746,12 @@ createMasterUI = function()
 					if onSelect then onSelect(e) end
 					if not opts.keepOpen then api.close() end
 				end)
+			end
+			if isOpen then
+				contentBox.Size = UDim2.new(1, 0, 0, listH + extraH + 16)
+				list.Size = UDim2.new(1, -16, 0, listH)
+				container.Size = UDim2.new(1, 0, 0, 42 + listH + extraH + 16)
+				task.delay(0.05, syncPanels)
 			end
 		end
 		header.MouseButton1Down:Connect(function() ripple(header) end)
@@ -1851,10 +1763,11 @@ createMasterUI = function()
 					{ Size = UDim2.new(1, 0, 0, 42 + listH + extraH + 16) }):Play()
 			else api.close() end
 			if opts.onToggle then opts.onToggle(isOpen) end
+			task.delay(0.36, syncPanels)
 		end)
 		api.setEntries(entries)
 		if opts.buildExtra then
-			extraFrame = make("Frame", { Size = UDim2.new(1, -16, 0, extraH), Position = UDim2.new(0, 8, 0, listH + 12),
+			local extraFrame = make("Frame", { Size = UDim2.new(1, -16, 0, extraH), Position = UDim2.new(0, 8, 0, listH + 12),
 				BackgroundTransparency = 1 }, contentBox)
 			make("UIListLayout", { Padding = UDim.new(0, 6) }, extraFrame)
 			opts.buildExtra(extraFrame)
@@ -1862,7 +1775,10 @@ createMasterUI = function()
 		return api
 	end
 
-	local function createExpandPanel(parent, title, openHeight, tip)
+	------------------------------------------------
+	-- EXPAND PANEL (auto height so nothing gets clipped)
+	------------------------------------------------
+	local function createExpandPanel(parent, title, tip)
 		local container = make("Frame", { Size = UDim2.new(1, 0, 0, 36), BackgroundTransparency = 1, ClipsDescendants = true }, parent)
 		local header = make("TextButton", { Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = T.Panel, Text = "",
 			AutoButtonColor = false, ClipsDescendants = true }, container)
@@ -1873,22 +1789,33 @@ createMasterUI = function()
 		if tip then addTooltip(tl, tip) end
 		local arrow = make("TextLabel", { Size = UDim2.new(0, 30, 1, 0), Position = UDim2.new(1, -38, 0, 0),
 			BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "v", TextColor3 = T.Accent, TextSize = 13 }, header)
-		local bodyF = make("Frame", { Size = UDim2.new(1, -14, 0, openHeight), Position = UDim2.new(0, 7, 0, 40),
-			BackgroundTransparency = 1 }, container)
-		make("UIListLayout", { Padding = UDim.new(0, 6) }, bodyF)
+		local bodyF = make("Frame", { Size = UDim2.new(1, -14, 0, 0), Position = UDim2.new(0, 7, 0, 42),
+			BackgroundTransparency = 1, AutomaticSize = Enum.AutomaticSize.Y }, container)
+		make("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, bodyF)
+
 		local open = false
+		local function want() return 42 + bodyF.AbsoluteSize.Y + 8 end
+		table.insert(panelSyncers, function()
+			if open and container.Parent then container.Size = UDim2.new(1, 0, 0, want()) end
+		end)
+
 		header.MouseButton1Down:Connect(function() ripple(header) end)
 		header.MouseButton1Click:Connect(function()
 			playClick(); open = not open
 			arrow.Text = open and "^" or "v"
-			TweenService:Create(container, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
-				{ Size = UDim2.new(1, 0, 0, open and (40 + openHeight + 8) or 36) }):Play()
+			if open then
+				TweenService:Create(container, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+					{ Size = UDim2.new(1, 0, 0, want()) }):Play()
+			else
+				TweenService:Create(container, TweenInfo.new(0.22, Enum.EasingStyle.Quad),
+					{ Size = UDim2.new(1, 0, 0, 36) }):Play()
+			end
 		end)
 		return container, bodyF
 	end
 
 	------------------------------------------------
-	-- COLOR PICKER (HSV: hue / saturation / value)
+	-- COLOR PICKER
 	------------------------------------------------
 	local function createColorPicker(parent, label, key)
 		local holder = make("Frame", { Size = UDim2.new(1, 0, 0, 100), BackgroundColor3 = T.Panel,
@@ -1908,11 +1835,11 @@ createMasterUI = function()
 		local h, s, v = T[key]:ToHSV()
 		local bars = {}
 
-		local function makeBar(y, gradFn, getV, setV)
+		local function makeBar(y, getV, setV)
 			local track = make("TextButton", { Size = UDim2.new(1, -66, 0, 12), Position = UDim2.new(0, 10, 0, y),
 				BackgroundColor3 = Color3.new(1, 1, 1), Text = "", AutoButtonColor = false }, holder)
 			corner(track, 99); stroke(track, Color3.new(0, 0, 0), 0.6)
-			local grad = make("UIGradient", { Color = gradFn() }, track)
+			local grad = make("UIGradient", { Color = ColorSequence.new(Color3.new(1, 1, 1)) }, track)
 			local knob = make("Frame", { Size = UDim2.new(0, 12, 0, 16), AnchorPoint = Vector2.new(0.5, 0.5),
 				Position = UDim2.new(getV(), 0, 0.5, 0), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 2 }, track)
 			corner(knob, 99); stroke(knob, Color3.new(0, 0, 0), 0.3)
@@ -1961,13 +1888,9 @@ createMasterUI = function()
 			saveConfig()
 		end
 
-		makeBar(32, function() return ColorSequence.new(Color3.new(1, 1, 1)) end, function() return h end,
-			function(x) h = x; refresh() end)
-		makeBar(56, function() return ColorSequence.new(Color3.new(1, 1, 1)) end, function() return s end,
-			function(x) s = x; refresh() end)
-		makeBar(80, function() return ColorSequence.new(Color3.new(1, 1, 1)) end, function() return v end,
-			function(x) v = x; refresh() end)
-
+		makeBar(32, function() return h end, function(x) h = x; refresh() end)
+		makeBar(56, function() return s end, function(x) s = x; refresh() end)
+		makeBar(80, function() return v end, function(x) v = x; refresh() end)
 		refresh()
 		return holder
 	end
@@ -2013,7 +1936,7 @@ createMasterUI = function()
 		end
 		local nb, bar = navBtns[name], navBars[name]
 		if nb then
-			TweenService:Create(nb, TweenInfo.new(0.2), { BackgroundColor3 = Color3.fromRGB(35, 48, 115), BackgroundTransparency = 0, TextColor3 = T.Text }):Play()
+			TweenService:Create(nb, TweenInfo.new(0.2), { BackgroundColor3 = T.Hover, BackgroundTransparency = 0, TextColor3 = T.Text }):Play()
 			TweenService:Create(bar, TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
 				{ Size = UDim2.new(0, 3, 0, 20), Position = UDim2.new(0, 0, 0.5, -10) }):Play()
 		end
@@ -2047,7 +1970,7 @@ createMasterUI = function()
 		local pw = math.min(520, vpSize.X - 30)
 		local ph = math.min(380, vpSize.Y - 60)
 		local panel = make("Frame", { Name = "ShapeCanvas", Size = UDim2.new(0, pw, 0, 0),
-			Position = UDim2.new(0.5, -pw / 2, 0.5, -ph / 2), BackgroundColor3 = Color3.fromRGB(14, 18, 36),
+			Position = UDim2.new(0.5, -pw / 2, 0.5, -ph / 2), BackgroundColor3 = T.Bg2,
 			BorderSizePixel = 0, ZIndex = 60, ClipsDescendants = true }, gui)
 		corner(panel, 12); stroke(panel, T.Accent, 0.15, 1.5)
 		TweenService:Create(panel, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = UDim2.new(0, pw, 0, ph) }):Play()
@@ -2059,12 +1982,8 @@ createMasterUI = function()
 			TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 61 }, panel)
 
 		local canvas = make("Frame", { Size = UDim2.new(1, -32, 1, -104), Position = UDim2.new(0, 16, 0, 58),
-			BackgroundColor3 = Color3.fromRGB(6, 8, 16), ClipsDescendants = true, Active = true, ZIndex = 61 }, panel)
-		corner(canvas, 8); stroke(canvas, Color3.fromRGB(60, 85, 160), 0.4)
-		make("Frame", { Size = UDim2.new(0, 1, 1, 0), Position = UDim2.new(0.5, 0, 0, 0),
-			BackgroundColor3 = Color3.fromRGB(45, 60, 110), BorderSizePixel = 0 }, canvas)
-		make("Frame", { Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 0.5, 0),
-			BackgroundColor3 = Color3.fromRGB(45, 60, 110), BorderSizePixel = 0 }, canvas)
+			BackgroundColor3 = T.Field, ClipsDescendants = true, Active = true, ZIndex = 61 }, panel)
+		corner(canvas, 8); stroke(canvas, T.Stroke, 0.4)
 
 		local points = {}
 		local drawing = false
@@ -2171,9 +2090,9 @@ createMasterUI = function()
 			saveConfig()
 		end, Enum.KeyCode.P, "Highlight every player with a nametag")
 
-		local _, espBody = createExpandPanel(p, "ESP Settings", 178, "Colors, health, filters and range")
+		local _, espBody = createExpandPanel(p, "ESP Settings", "Colours, health, filters and range")
 		createToggle(espBody, "Team Based Colors", espTeamColors, function(v) espTeamColors = v; saveConfig() end,
-			"Color highlights by team and prepend the team name", false)
+			"Colour highlights by team and prepend the team name", false)
 		createToggle(espBody, "Include Health", espShowHealth, function(v) espShowHealth = v; saveConfig() end,
 			"Show current health on the nametag", false)
 		createToggle(espBody, "Friends Only", espFriendsOnly, function(v)
@@ -2185,7 +2104,7 @@ createMasterUI = function()
 			end
 			saveConfig()
 		end, "Only show friends", false)
-		createSlider(espBody, "ESP Range", 50, 2000, MAX_ESP_DISTANCE, 10, function(v) MAX_ESP_DISTANCE = v; saveConfig() end,
+		createSlider(espBody, "ESP Range", 50, 2000, MAX_ESP_DISTANCE, 10, function(v) MAX_ESP_DISTANCE = v end,
 			"Player ESP range in studs")
 
 		createToggleKeybind(p, "Fullbright", fullBrightActive, function(v)
@@ -2218,18 +2137,14 @@ createMasterUI = function()
 		end, Enum.KeyCode.B, "Remove the zoom-out distance cap")
 
 		sectionTitle(p, "Animal ESP")
-
 		createToggleKeybind(p, "Animal ESP", animalEspActive, function(v)
 			animalEspActive = v
-			if not v then
-				forEachAnimal(function(a) removeESP(a, "AnimalESP") end)
-			end
+			if not v then forEachAnimal(function(a) removeESP(a, "AnimalESP") end) end
 			saveConfig()
 		end, Enum.KeyCode.N, "Highlight animals from Workspace.Animals")
 
-		local _, animalBody = createExpandPanel(p, "Animal ESP Settings", 178, "Range, health and ignore list")
-
-		createSlider(animalBody, "ESP Range", 50, 2000, ANIMAL_ESP_DISTANCE, 10, function(v) ANIMAL_ESP_DISTANCE = v; saveConfig() end,
+		local _, animalBody = createExpandPanel(p, "Animal ESP Settings", "Range, health and ignore list")
+		createSlider(animalBody, "ESP Range", 50, 2000, ANIMAL_ESP_DISTANCE, 10, function(v) ANIMAL_ESP_DISTANCE = v end,
 			"Animal ESP range in studs")
 		createToggle(animalBody, "Include Health", animalEspHealth, function(v) animalEspHealth = v; saveConfig() end,
 			"Show animal health on the nametag", false)
@@ -2255,7 +2170,6 @@ createMasterUI = function()
 			if animalIgnore[e.value] == false then animalIgnore[e.value] = nil end
 			animalDrop.setEntries(animalEntries())
 			forEachAnimal(function(a) removeESP(a, "AnimalESP") end)
-			saveConfig()
 		end, {
 			tip = "Click to toggle ignoring that animal group",
 			keepOpen = true,
@@ -2263,31 +2177,70 @@ createMasterUI = function()
 		})
 
 		sectionTitle(p, "Movement")
-
-		local function applyWalkSpeed()
-			local ch = LocalPlayer.Character
-			local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-			if hum then hum.WalkSpeed = walkBoostActive and walkSpeedValue or 16 end
-		end
-
-		createSlider(p, "Walk Speed", 1, 32, walkSpeedValue, 1, function(v)
-			walkSpeedValue = v
-			if walkBoostActive then applyWalkSpeed() end
-			saveConfig()
-		end, "Boosted speed used when the Walk Speed toggle is on (1-32)")
-
 		createToggleKeybind(p, "Walk Speed Boost", walkBoostActive, function(v)
 			walkBoostActive = v
-			applyWalkSpeed()
+			local ch = LocalPlayer.Character
+			local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+			if hum then hum.WalkSpeed = v and walkSpeedValue or 16 end
 			showNotification(v and ("Walk Speed: " .. walkSpeedValue) or "Walk Speed: default", 1.4)
-			saveConfig()
 		end, Enum.KeyCode.G, "Toggle between default (16) and your Walk Speed value")
 
-		sectionTitle(p, "Teleport")
+		local _, moveBody = createExpandPanel(p, "Movement Settings", "Walk speed and jump tweaks")
+		createSlider(moveBody, "Walk Speed", 1, 32, walkSpeedValue, 1, function(v)
+			walkSpeedValue = v
+			if walkBoostActive then
+				local ch = LocalPlayer.Character
+				local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+				if hum then hum.WalkSpeed = v end
+			end
+		end, "Boosted speed used when Walk Speed Boost is on")
 
-		local tpLbl = make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
-			Font = Enum.Font.GothamMedium, Text = "Target: none (uses cursor)", TextColor3 = T.Dim, TextSize = 10,
-			TextXAlignment = Enum.TextXAlignment.Left }, p)
+		sectionTitle(p, "Teleport")
+		createToggleKeybind(p, "Teleport", false, function(v)
+			if not v then return end
+			if tpTarget and tpTarget.Parent and tpTarget.Character and tpTarget.Character:FindFirstChild("HumanoidRootPart") then
+				local ch = LocalPlayer.Character
+				local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+				if hrp then
+					local target = tpTarget.Character.HumanoidRootPart.Position + Vector3.new(0, 3, 0)
+					task.spawn(function()
+						local start = hrp.Position
+						local steps = math.clamp(math.floor((target - start).Magnitude / 40) + 2, 2, 30)
+						hrp.AssemblyLinearVelocity = Vector3.zero
+						for i = 1, steps do
+							if not hrp.Parent then break end
+							hrp.CFrame = CFrame.new(start:Lerp(target, i / steps))
+							RunService.RenderStepped:Wait()
+						end
+						hrp.CFrame = CFrame.new(target)
+						hrp.AssemblyLinearVelocity = Vector3.zero
+					end)
+				end
+				showNotification("Teleported to " .. tpTarget.Name, 1.5)
+			else
+				local pos = getClickPosition()
+				local ch = LocalPlayer.Character
+				local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+				if hrp then
+					local target = pos + Vector3.new(0, 3, 0)
+					task.spawn(function()
+						local start = hrp.Position
+						local steps = math.clamp(math.floor((target - start).Magnitude / 40) + 2, 2, 30)
+						for i = 1, steps do
+							if not hrp.Parent then break end
+							hrp.CFrame = CFrame.new(start:Lerp(target, i / steps))
+							RunService.RenderStepped:Wait()
+						end
+						hrp.CFrame = CFrame.new(target)
+					end)
+				end
+				showNotification("Teleported to cursor", 1.5)
+			end
+		end, Enum.KeyCode.T, "Click the row to teleport")
+
+		local _, tpBody = createExpandPanel(p, "Teleport Settings", "Target and anti-cheat options")
+		createToggle(tpBody, "Safe TP (anti-cheat)", tpSafe, function(v) tpSafe = v end,
+			"Interpolate move to dodge distance flags", false)
 
 		local function tpEntries()
 			local list = {
@@ -2301,8 +2254,12 @@ createMasterUI = function()
 			return list
 		end
 
+		local tpLbl = make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
+			Font = Enum.Font.GothamMedium, Text = "Target: none (uses cursor)", TextColor3 = T.Dim, TextSize = 10,
+			TextXAlignment = Enum.TextXAlignment.Left }, tpBody)
+
 		local tpDrop
-		tpDrop = createDropdown(p, "Teleport Target", tpEntries(), function(e)
+		tpDrop = createDropdown(tpBody, "Teleport Target", tpEntries(), function(e)
 			if e.value == "click" then
 				tpTarget = nil; tpLbl.Text = "Target: click a player"
 			elseif e.value == "nearest" then
@@ -2324,51 +2281,11 @@ createMasterUI = function()
 			end
 		end, { tip = "Who to teleport to" })
 
-		local function teleportTo(pos)
-			local ch = LocalPlayer.Character
-			local hrp = ch and ch:FindFirstChild("HumanoidRootPart"); if not hrp then return end
-			local hum = ch:FindFirstChildOfClass("Humanoid")
-			local target = pos + Vector3.new(0, 3, 0)
-			if not tpSafe then
-				hrp.CFrame = CFrame.new(target); hrp.AssemblyLinearVelocity = Vector3.zero; return
-			end
-			task.spawn(function()
-				local start = hrp.Position
-				local steps = math.clamp(math.floor((target - start).Magnitude / 40) + 2, 2, 30)
-				hrp.AssemblyLinearVelocity = Vector3.zero
-				if hum then hum:ChangeState(Enum.HumanoidStateType.Freefall) end
-				for i = 1, steps do
-					if not hrp.Parent then break end
-					hrp.CFrame = CFrame.new(start:Lerp(target, i / steps))
-					RunService.RenderStepped:Wait()
-				end
-				hrp.CFrame = CFrame.new(target)
-				hrp.AssemblyLinearVelocity = Vector3.zero
-				if hum then hum:ChangeState(Enum.HumanoidStateType.Running) end
-			end)
-		end
-
-		local function doTP()
-			if tpTarget and tpTarget.Parent and tpTarget.Character and tpTarget.Character:FindFirstChild("HumanoidRootPart") then
-				teleportTo(tpTarget.Character.HumanoidRootPart.Position)
-				showNotification("Teleported to " .. tpTarget.Name, 1.5)
-			else
-				teleportTo(getClickPosition())
-				showNotification("Teleported to cursor", 1.5)
-			end
-		end
-
-		createToggleKeybind(p, "Teleport", false, function(v) if v then doTP() end end, Enum.KeyCode.T, "Click the row to teleport")
-		createToggle(p, "Safe TP (anti-cheat)", tpSafe, function(v) tpSafe = v end, "Interpolate move to dodge distance flags", false)
-
 		Players.PlayerAdded:Connect(function() task.wait(0.5); tpDrop.setEntries(tpEntries()) end)
 		Players.PlayerRemoving:Connect(function() task.wait(0.3); tpDrop.setEntries(tpEntries()) end)
 
-		sectionTitle(p, "Wellness Manager")
-
-		local wLbl = make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
-			Font = Enum.Font.GothamMedium, Text = "Target: Local Player", TextColor3 = T.Dim, TextSize = 10,
-			TextXAlignment = Enum.TextXAlignment.Left }, p)
+		sectionTitle(p, "Wellness")
+		local _, wBody = createExpandPanel(p, "Wellness Settings", "Target, mode and amounts")
 
 		local function wEntries()
 			local list = {
@@ -2383,8 +2300,12 @@ createMasterUI = function()
 			return list
 		end
 
+		local wLbl = make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
+			Font = Enum.Font.GothamMedium, Text = "Target: Local Player", TextColor3 = T.Dim, TextSize = 10,
+			TextXAlignment = Enum.TextXAlignment.Left }, wBody)
+
 		local wDrop
-		wDrop = createDropdown(p, "Wellness Target", wEntries(), function(e)
+		wDrop = createDropdown(wBody, "Wellness Target", wEntries(), function(e)
 			if e.value == "click" then
 				wellnessTarget = nil; wellnessClickMode = true
 				wLbl.Text = "Target: click a player"
@@ -2397,7 +2318,7 @@ createMasterUI = function()
 		Players.PlayerAdded:Connect(function() task.wait(0.5); wDrop.setEntries(wEntries()) end)
 		Players.PlayerRemoving:Connect(function() task.wait(0.3); wDrop.setEntries(wEntries()) end)
 
-		local modeBtn = createButton(p, "Mode: ADD", Color3.fromRGB(38, 110, 60), "Switch between ADD and REMOVE")
+		local modeBtn = createButton(wBody, "Mode: ADD", Color3.fromRGB(38, 110, 60), "Switch between ADD and REMOVE")
 		local addMode = true
 		modeBtn.MouseButton1Click:Connect(function()
 			addMode = not addMode
@@ -2406,7 +2327,7 @@ createMasterUI = function()
 			changeValueMode = addMode and "add" or "remove"
 		end)
 
-		local row = make("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, p)
+		local row = make("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, wBody)
 		local hungerBox = make("TextBox", { Size = UDim2.new(0.22, 0, 1, 0), Text = "10", PlaceholderText = "Amt" }, row); styleField(hungerBox)
 		local hBtn = make("TextButton", { Size = UDim2.new(0.24, 0, 1, 0), Position = UDim2.new(0.24, 0, 0, 0),
 			BackgroundColor3 = Color3.fromRGB(38, 140, 70), Font = Enum.Font.GothamBold, Text = "Hunger",
@@ -2432,6 +2353,38 @@ createMasterUI = function()
 		end
 		hBtn.MouseButton1Click:Connect(function() applyWellness("Hunger", hungerBox) end)
 		tBtn.MouseButton1Click:Connect(function() applyWellness("Thirst", thirstBox) end)
+
+		sectionTitle(p, "Server")
+		local srvRow = make("Frame", { Size = UDim2.new(1, 0, 0, 32), BackgroundTransparency = 1 }, p)
+		local rejoinBtn = createButton(srvRow, "Rejoin Server", Color3.fromRGB(38, 110, 60), "Reconnect to this exact server")
+		rejoinBtn.Size = UDim2.new(0.49, 0, 1, 0)
+		rejoinBtn.MouseButton1Click:Connect(function()
+			showNotification("Rejoining...", 1.5)
+			pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer) end)
+		end)
+		local hopBtn = createButton(srvRow, "Server Hop", Color3.fromRGB(41, 128, 185), "Jump to a different server of this game")
+		hopBtn.Size = UDim2.new(0.49, 0, 1, 0)
+		hopBtn.Position = UDim2.new(0.51, 0, 0, 0)
+		hopBtn.MouseButton1Click:Connect(function()
+			showNotification("Searching servers...", 1.5)
+			task.spawn(function()
+				local url = ("https://games.roblox.com/v1/games/%d/servers/Public?limit=100"):format(game.PlaceId)
+				local data = httpJson(url)
+				if not data or type(data.data) ~= "table" then
+					showNotification("Server list unavailable", 2); return
+				end
+				local pool = {}
+				for _, srv in ipairs(data.data) do
+					if srv.id ~= game.JobId and srv.playing < srv.maxPlayers and srv.playing < 40 then
+						table.insert(pool, srv)
+					end
+				end
+				if #pool == 0 then showNotification("No other servers found", 2); return end
+				local pick = pool[math.random(1, #pool)]
+				showNotification(("Hopping (%d/%d players)..."):format(pick.playing, pick.maxPlayers), 2)
+				pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, pick.id, LocalPlayer) end)
+			end)
+		end)
 	end
 
 	------------------------------------------------
@@ -2439,12 +2392,11 @@ createMasterUI = function()
 	------------------------------------------------
 	do
 		local p = PAGE.Item
-		sectionTitle(p, "Throwable Configuration")
+		sectionTitle(p, "Throwable")
 
-		-- small preview of current throwable (camera pulled in close)
-		local pv = make("ViewportFrame", { Size = UDim2.new(1, 0, 0, 92), BackgroundColor3 = Color3.fromRGB(10, 13, 22) }, p)
-		corner(pv, 8); stroke(pv, Color3.fromRGB(50, 70, 130), 0.5)
-		local pvCam = make("Camera", {}, pv); pv.CurrentCamera = pvCam
+		local pv = make("ViewportFrame", { Size = UDim2.new(1, 0, 0, 92), BackgroundColor3 = T.Field }, p)
+		corner(pv, 8); stroke(pv, T.Stroke, 0.5)
+		local pvCam = newViewportCamera(pv); pv.CurrentCamera = pvCam
 		local pvWorld = make("WorldModel", {}, pv)
 		local pvLabel = make("TextLabel", { Size = UDim2.new(1, -10, 0, 14), Position = UDim2.new(0, 6, 0, 2),
 			BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "CURRENT THROWABLE", TextColor3 = T.Dim,
@@ -2466,66 +2418,54 @@ createMasterUI = function()
 				return clone.Size
 			end)
 			if ok and b then size = b end
-			-- tighter framing: was * 1.15 + 3
 			local dist = size.Magnitude * 0.85 + 1.2
 			pvCam.CFrame = CFrame.new(Vector3.new(1, 0.6, 1).Unit * dist, Vector3.zero)
 			pvLabel.Text = "CURRENT THROWABLE — " .. currentThrowableName
 		end
 
-		createTextBox(p, "Throwable Name", "e.g. Obsidian Spear", currentThrowableName, function(v)
+		createToggleKeybind(p, "Throw On Click", throwEnabled, function(v)
+			throwEnabled = v
+			showNotification(v and "Throwing ARMED" or "Throwing disarmed", 1.4)
+		end, Enum.KeyCode.O, "Click / tap anywhere to throw")
+
+		local _, itemBody = createExpandPanel(p, "Throwable Settings", "Item, count, delay and spread shape")
+		createTextBox(itemBody, "Throwable Name", "e.g. Obsidian Spear", currentThrowableName, function(v)
 			if v ~= "" then
 				currentThrowableName = v
 				applyThrowableStats(v)
 				refreshThrowPreview()
-				saveConfig()
 				showNotification("Throwable set to: " .. v, 1.6)
 			end
 		end, "Item model name to throw")
-		refreshThrowPreview()
+		createSlider(itemBody, "Item Count", 1, 80, throwCount, 1, function(v) throwCount = v end, "Items thrown per click")
+		createSlider(itemBody, "Throw Delay", 0.01, 1, throwDelay, 0.01, function(v) throwDelay = v end, "Delay between each spawned item")
 
-		createToggleKeybind(p, "Throw On Click", throwEnabled, function(v)
-			throwEnabled = v
-			showNotification(v and "Throwing ARMED" or "Throwing disarmed", 1.4)
-			saveConfig()
-		end, Enum.KeyCode.O, "Click / tap anywhere to throw")
-
-		createSlider(p, "Item Count", 1, 80, throwCount, 1, function(v) throwCount = v; saveConfig() end, "How many items thrown per click")
-		createSlider(p, "Throw Delay", 0.01, 1, throwDelay, 0.01, function(v) throwDelay = v; saveConfig() end, "Delay between each spawned item")
-
-		shapeDrop = createDropdown(p, "Item Shape", {
+		shapeDrop = createDropdown(itemBody, "Item Shape", {
 			{ text = "Box", value = "Box" },
 			{ text = "Circle", value = "Circle" },
 			{ text = "Custom (draw)", value = "Custom" },
 		}, function(e)
 			if e.value == "Custom" then throwShape = "Custom"; openShapeCanvas()
 			else throwShape = e.value; showNotification("Shape: " .. e.value, 1.2) end
-			saveConfig()
 		end, { tip = "Spread pattern of the thrown items" })
 
-		local row = make("Frame", { Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1 }, p)
-		local redraw = createButton(row, "Open Shape Canvas", Color3.fromRGB(35, 60, 120), "Draw a custom spread pattern")
-		redraw.Size = UDim2.new(1, 0, 1, 0)
+		local redraw = createButton(itemBody, "Open Shape Canvas", Color3.fromRGB(35, 60, 120), "Draw a custom spread pattern")
 		redraw.MouseButton1Click:Connect(function() openShapeCanvas() end)
+		refreshThrowPreview()
 
-		sectionTitle(p, "Item Settings")
-		createDropdown(p, "Item Settings", {}, nil, {
-			tip = "Item behaviour modes",
-			extraHeight = 76,
-			buildExtra = function(extra)
-				createToggle(extra, "No Damaging Item", spearMode.visualOnly, function(v)
-					spearMode.visualOnly = v
-					if v then spearMode.noVisual = false end
-					ensureHookSupport()
-					showNotification(v and "No-damage ON" or "No-damage OFF", 1.6)
-				end, "Spawns & replicates the item but deals no damage", false)
-				createToggle(extra, "No Visual Item", spearMode.noVisual, function(v)
-					spearMode.noVisual = v
-					if v then spearMode.visualOnly = false end
-					ensureHookSupport()
-					showNotification(v and "No-visual ON" or "No-visual OFF", 1.6)
-				end, "Fires the hit remote only; shows a tracer", false)
-			end
-		})
+		local _, behBody = createExpandPanel(p, "Item Behaviour", "No-damage and no-visual modes")
+		createToggle(behBody, "No Damaging Item", spearMode.visualOnly, function(v)
+			spearMode.visualOnly = v
+			if v then spearMode.noVisual = false end
+			ensureHookSupport()
+			showNotification(v and "No-damage ON" or "No-damage OFF", 1.6)
+		end, "Spawns & replicates the item but deals no damage", false)
+		createToggle(behBody, "No Visual Item", spearMode.noVisual, function(v)
+			spearMode.noVisual = v
+			if v then spearMode.visualOnly = false end
+			ensureHookSupport()
+			showNotification(v and "No-visual ON" or "No-visual OFF", 1.6)
+		end, "Fires the hit remote only; shows a tracer", false)
 	end
 
 	------------------------------------------------
@@ -2535,23 +2475,21 @@ createMasterUI = function()
 		local p = PAGE.Builder
 		sectionTitle(p, "Structure")
 
-		createTextBox(p, "Structure Model Name", "e.g. Shelter", buildState.StructureName, function(v)
+		local _, structBody = createExpandPanel(p, "Structure Settings", "Which model gets placed")
+		createTextBox(structBody, "Structure Model Name", "e.g. Shelter", buildState.StructureName, function(v)
 			buildState.StructureName = v
-			saveConfig()
 		end, "Name of the model to place")
 
-		local vp = make("ViewportFrame", { Size = UDim2.new(1, 0, 0, 130), BackgroundColor3 = Color3.fromRGB(14, 18, 24), Visible = false }, p)
-		corner(vp, 8); stroke(vp, Color3.fromRGB(46, 52, 66), 0.5)
-		local vpCam = make("Camera", {}, vp); vp.CurrentCamera = vpCam
+		local vp = make("ViewportFrame", { Size = UDim2.new(1, 0, 0, 130), BackgroundColor3 = T.Field, Visible = false }, p)
+		corner(vp, 8); stroke(vp, T.Stroke, 0.5)
+		local vpCam = newViewportCamera(vp); vp.CurrentCamera = vpCam
 		local vpWorld = make("WorldModel", {}, vp)
 		local vpArrows = {}
 
-		-- ALL axes that were modified are applied together (X + Y + Z), not just the selected one
 		local function offsetVector()
 			local o = buildState.AxisOffset
 			return Vector3.new(o.X, o.Y, -5 + o.Z)
 		end
-
 		local function baseCFrame()
 			return CFrame.new(offsetVector()) * CFrame.Angles(
 				math.rad(buildState.Rotation.X), math.rad(buildState.Rotation.Y), math.rad(buildState.Rotation.Z))
@@ -2595,7 +2533,7 @@ createMasterUI = function()
 			vpCam.CFrame = CFrame.new(Vector3.new(7, 7, 7), Vector3.new(0, 1, -2.5))
 		end
 
-		sectionTitle(p, "Rotation Axis")
+		sectionTitle(p, "Placement")
 
 		local axisRow = make("Frame", { Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1 }, p)
 		local axisButtons = {}
@@ -2606,8 +2544,8 @@ createMasterUI = function()
 		local function refreshAxisButtons()
 			for b, a in pairs(axisButtons) do
 				local on = (a == buildState.SelectedAxis)
-				b.BackgroundColor3 = on and T.Accent or Color3.fromRGB(28, 34, 46)
-				b.TextColor3 = on and Color3.fromRGB(15, 15, 20) or T.Dim
+				b.BackgroundColor3 = on and T.Accent or T.PanelD
+				b.TextColor3 = on and T.Bg2 or T.Dim
 			end
 			if holdUp then holdUp.Text = axisLabel("+") end
 			if holdDown then holdDown.Text = axisLabel("-") end
@@ -2615,12 +2553,11 @@ createMasterUI = function()
 
 		for i, ax in ipairs({ "X", "Y", "Z" }) do
 			local b = make("TextButton", { Size = UDim2.new(0.31, 0, 1, 0), Position = UDim2.new((i - 1) * 0.345, 0, 0, 0),
-				BackgroundColor3 = Color3.fromRGB(28, 34, 46), Font = Enum.Font.GothamBold, Text = "Axis " .. ax,
+				BackgroundColor3 = T.PanelD, Font = Enum.Font.GothamBold, Text = "Axis " .. ax,
 				TextColor3 = T.Dim, TextSize = 10, ClipsDescendants = true }, axisRow)
 			corner(b, 7); stroke(b, T.Stroke, 0.5)
 			b.MouseButton1Down:Connect(function() ripple(b) end)
 			b.MouseButton1Click:Connect(function()
-				-- offsets are stored per axis and ALL of them stay applied when you switch
 				buildState.SelectedAxis = ax
 				refreshAxisButtons(); refreshViewport()
 				showNotification("Axis: " .. ax, 1.2)
@@ -2632,8 +2569,8 @@ createMasterUI = function()
 		make("UIGridLayout", { CellSize = UDim2.new(0.48, 0, 0, 24), CellPadding = UDim2.new(0.04, 0, 0.08, 0) }, ctrl)
 
 		local function gridBtn(text)
-			local b = make("TextButton", { BackgroundColor3 = Color3.fromRGB(34, 40, 54), Font = Enum.Font.GothamBold,
-				Text = text, TextColor3 = Color3.fromRGB(220, 220, 220), TextSize = 9, ClipsDescendants = true }, ctrl)
+			local b = make("TextButton", { BackgroundColor3 = T.PanelD, Font = Enum.Font.GothamBold,
+				Text = text, TextColor3 = T.Text, TextSize = 9, ClipsDescendants = true }, ctrl)
 			corner(b, 7); stroke(b, T.Stroke, 0.5)
 			b.MouseButton1Down:Connect(function() ripple(b) end)
 			return b
@@ -2647,13 +2584,11 @@ createMasterUI = function()
 			local ax = buildState.SelectedAxis
 			buildState.AxisOffset[ax] = buildState.AxisOffset[ax] + d
 			refreshViewport()
-			saveConfig()
 		end
 		local holdAction
 		local function startHold(fn) holdAction = fn; task.spawn(function() while holdAction == fn do fn(); task.wait(0.03) end end) end
 		local function stopHold() holdAction = nil end
 
-		-- MouseLeave (NOT MouseButton1Leave — that one doesn't exist and used to abort the whole UI build)
 		holdUp.MouseButton1Down:Connect(function() startHold(function() nudge(0.15) end) end)
 		holdUp.MouseButton1Up:Connect(stopHold); holdUp.MouseLeave:Connect(stopHold)
 		holdDown.MouseButton1Down:Connect(function() startHold(function() nudge(-0.15) end) end)
@@ -2665,17 +2600,15 @@ createMasterUI = function()
 			elseif buildState.SelectedAxis == "Y" then buildState.Rotation = Vector3.new(r.X, (r.Y + d) % 360, r.Z)
 			else buildState.Rotation = Vector3.new(r.X, r.Y, (r.Z + d) % 360) end
 			refreshViewport()
-			saveConfig()
 		end
 		rotP.MouseButton1Down:Connect(function() startHold(function() rotDelta(3) end) end)
 		rotP.MouseButton1Up:Connect(stopHold); rotP.MouseLeave:Connect(stopHold)
 		rotN.MouseButton1Down:Connect(function() startHold(function() rotDelta(-3) end) end)
-		rotN.MouseButton1Up:Connect(stopHold); rotN.MouseButton1Up:Connect(stopHold); rotN.MouseLeave:Connect(stopHold)
+		rotN.MouseButton1Up:Connect(stopHold); rotN.MouseLeave:Connect(stopHold)
 
 		resetOff.MouseButton1Click:Connect(function()
 			buildState.AxisOffset = { X = 0, Y = 0, Z = 0 }
 			refreshViewport()
-			saveConfig()
 			showNotification("All axis offsets reset", 1.4)
 		end)
 
@@ -2695,12 +2628,20 @@ createMasterUI = function()
 			clearAxisArrows(worldArrows); worldArrows = {}
 			buildState.IsConstructing = false
 			vp.Visible = false; ctrl.Visible = false
+			-- give the mouse back
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+			UserInputService.MouseIconEnabled = true
 		end
 		uiRefs.cancelBuild = cancelBuild
 
 		local function startBuild()
 			local nm = buildState.StructureName
 			if not nm or nm == "" then showNotification("Enter a structure name!", 1.6); return end
+			-- mouse hygiene: stop anything from holding the cursor
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+			UserInputService.MouseIconEnabled = true
+			Workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+
 			local src = getStructureByName(nm)
 			local size = Vector3.new(4, 4, 4)
 			if src then
@@ -2708,7 +2649,7 @@ createMasterUI = function()
 				elseif src:IsA("BasePart") then size = src.Size end
 			end
 			if buildState.BoundingBoxPart then buildState.BoundingBoxPart:Destroy() end
-			local box = make("Part", { Name = "StructurePlacementBox", Size = size, Color = Color3.fromRGB(85, 255, 127),
+			local box = make("Part", { Name = "StructurePlacementBox", Size = size, Color = T.Good,
 				Material = Enum.Material.SmoothPlastic, Transparency = 0.55, CanCollide = false, CanQuery = false,
 				CanTouch = false, CastShadow = false, Massless = true, Anchored = true }, Workspace)
 			buildState.BoundingBoxPart = box
@@ -2775,7 +2716,6 @@ createMasterUI = function()
 			end
 			for i = need + 1, #pathParts do pathParts[i].Transparency = 1 end
 		end
-
 		local function showPreview(a, b)
 			local dist = math.max((b - a).Magnitude, 0.1)
 			previewLine.Size = Vector3.new(0.25, 0.25, dist)
@@ -2825,22 +2765,18 @@ createMasterUI = function()
 			showNotification(v and "Concurrent ON - drag to preview" or "Concurrent OFF", 1.6)
 		end, Enum.KeyCode.Unknown, "Drag to preview a line, then confirm to build it")
 
-		-- every concurrent option (including Multi Line) lives in this panel now
-		local _, concurrentBody = createExpandPanel(p, "Concurrent Settings", IS_MOBILE and 278 or 240,
-			"Ground snap, spacing, range and multi line")
-
-		createToggle(concurrentBody, "Ground Snap", concurrent.GroundSnap, function(v) concurrent.GroundSnap = v; saveConfig() end,
+		local _, concurrentBody = createExpandPanel(p, "Concurrent Settings", "Ground snap, spacing, range and multi line")
+		createToggle(concurrentBody, "Ground Snap", concurrent.GroundSnap, function(v) concurrent.GroundSnap = v end,
 			"Drop each placed structure onto the ground", false)
-		createSlider(concurrentBody, "Structure Per Studs", 1, 60, concurrent.PerStuds, 1, function(v) concurrent.PerStuds = v; saveConfig() end, "One structure placed every N studs")
-		createSlider(concurrentBody, "Min Structure Spacing", 1, 40, concurrent.Spacing, 1, function(v) concurrent.Spacing = v; saveConfig() end, "Floor for the spacing")
-		createSlider(concurrentBody, "Concurrent Range", 50, 2000, concurrent.MaxRange, 10, function(v) concurrent.MaxRange = v; saveConfig() end, "Max reach from your character")
-
+		createSlider(concurrentBody, "Structure Per Studs", 1, 60, concurrent.PerStuds, 1, function(v) concurrent.PerStuds = v end, "One structure placed every N studs")
+		createSlider(concurrentBody, "Min Structure Spacing", 1, 40, concurrent.Spacing, 1, function(v) concurrent.Spacing = v end, "Floor for the spacing")
+		createSlider(concurrentBody, "Concurrent Range", 50, 2000, concurrent.MaxRange, 10, function(v) concurrent.MaxRange = v end, "Max reach from your character")
 		createToggleKeybind(concurrentBody, "Multi Line Mode", concurrent.MultiLine, function(v)
 			concurrent.MultiLine = v
 			concurrent.Path = {}
 			clearPathPreview(); hidePreview()
 			showNotification(v and "Multi Line ON" or "Multi Line OFF", 1.5)
-		end, Enum.KeyCode.Unknown, "Curved dragging — middle mouse also toggles this while Concurrent Mode is on")
+		end, Enum.KeyCode.Unknown, "Curved dragging — middle mouse also toggles this")
 
 		if IS_MOBILE then
 			createToggle(concurrentBody, "Auto Sweep (mobile)", concurrent.Auto, function(v)
@@ -2853,7 +2789,7 @@ createMasterUI = function()
 			local old = gui:FindFirstChild("DrawConfirm"); if old then old:Destroy() end
 			local isPath = path ~= nil
 			local f = make("Frame", { Name = "DrawConfirm", Size = UDim2.new(0, 300, 0, 0),
-				Position = UDim2.new(0.5, -150, 1, -110), BackgroundColor3 = Color3.fromRGB(16, 20, 44),
+				Position = UDim2.new(0.5, -150, 1, -110), BackgroundColor3 = T.Bg1,
 				BorderSizePixel = 0, ZIndex = 80, ClipsDescendants = true }, gui)
 			corner(f, 10); stroke(f, T.Accent, 0.2, 1.5)
 			TweenService:Create(f, TweenInfo.new(0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Size = UDim2.new(0, 300, 0, 74) }):Play()
@@ -2967,7 +2903,6 @@ createMasterUI = function()
 		local function lineStructureName()
 			return (lineCfg.CustomStructure ~= "" and lineCfg.CustomStructure) or buildState.StructureName
 		end
-
 		local function dominantDir()
 			local look = getCamera().CFrame.LookVector
 			if math.abs(look.Y) > 0.75 then return Vector3.new(0, math.sign(look.Y), 0) end
@@ -2997,12 +2932,12 @@ createMasterUI = function()
 			end)
 		end
 
-		createToggleKeybind(p, "Build Line", false, function(v) if v then buildLine() end end, Enum.KeyCode.H, "Builds in front of your dominant look direction")
+		createToggleKeybind(p, "Build Line", false, function(v) if v then buildLine() end end, Enum.KeyCode.H, "Builds in front of your look direction")
 
-		local _, lineBody = createExpandPanel(p, "Line Settings", 306, "Range, spacing, custom structure and preview")
-		local pv = make("ViewportFrame", { Size = UDim2.new(1, 0, 0, 86), BackgroundColor3 = Color3.fromRGB(10, 13, 22) }, lineBody)
-		corner(pv, 8); stroke(pv, Color3.fromRGB(50, 70, 130), 0.5)
-		local pvCam = make("Camera", {}, pv); pv.CurrentCamera = pvCam
+		local _, lineBody = createExpandPanel(p, "Line Settings", "Range, spacing and preview")
+		local pv = make("ViewportFrame", { Size = UDim2.new(1, 0, 0, 86), BackgroundColor3 = T.Field }, lineBody)
+		corner(pv, 8); stroke(pv, T.Stroke, 0.5)
+		local pvCam = newViewportCamera(pv); pv.CurrentCamera = pvCam
 		local pvWorld = make("WorldModel", {}, pv)
 		local pvLabel = make("TextLabel", { Size = UDim2.new(1, -10, 0, 14), Position = UDim2.new(0, 6, 0, 2),
 			BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "SPACING PREVIEW", TextColor3 = T.Dim,
@@ -3024,50 +2959,25 @@ createMasterUI = function()
 			pvLabel.Text = "SPACING PREVIEW - " .. gap .. " studs"
 		end
 
-		createSlider(lineBody, "Maximum Range", 100, 8000, lineCfg.Range, 50, function(v) lineCfg.Range = v; saveConfig() end, "Max line length in studs")
+		createSlider(lineBody, "Maximum Range", 100, 8000, lineCfg.Range, 50, function(v) lineCfg.Range = v end, "Max line length in studs")
 		createTextBox(lineBody, "Structure Per Studs", "e.g. 8", tostring(lineCfg.PerStuds), function(v)
-			local n = tonumber(v); if n and n > 0 then lineCfg.PerStuds = n; refreshSpacingPreview(); saveConfig() end
+			local n = tonumber(v); if n and n > 0 then lineCfg.PerStuds = n; refreshSpacingPreview() end
 		end, "One structure placed every N studs")
 		createTextBox(lineBody, "Custom Structure", "defaults to builder structure", lineCfg.CustomStructure, function(v)
-			lineCfg.CustomStructure = v; refreshSpacingPreview(); saveConfig()
+			lineCfg.CustomStructure = v; refreshSpacingPreview()
 		end, "Leave empty to use the builder structure")
-		createToggle(lineBody, "Ground Snap", lineCfg.GroundSnap, function(v) lineCfg.GroundSnap = v; saveConfig() end, "Drop each structure onto the ground", false)
+		createToggle(lineBody, "Ground Snap", lineCfg.GroundSnap, function(v) lineCfg.GroundSnap = v end, "Drop each structure onto the ground", false)
 		refreshSpacingPreview()
 
 		sectionTitle(p, "Trap")
-
-		local function trapEntries()
-			local list = {
-				{ text = "All Players", value = "all" },
-				{ text = "Nearest Player", value = "nearest" },
-				{ text = "Local Player", value = LocalPlayer },
-			}
-			for _, pl in ipairs(Players:GetPlayers()) do
-				if pl ~= LocalPlayer then
-					table.insert(list, { text = pl.DisplayName .. " (@" .. pl.Name .. ")", value = pl, image = getThumb(pl) })
-				end
-			end
-			return list
-		end
-
-		local _, trapBody = createExpandPanel(p, "Trap Settings", 290, "Target, structure and amount")
-		local trapDrop
-		trapDrop = createDropdown(trapBody, "Trap Target", trapEntries(), function(e) trapCfg.Target = e.value end,
-			{ tip = "Who to trap. Amount structures are ringed around them." })
-
-		Players.PlayerAdded:Connect(function() task.wait(0.5); trapDrop.setEntries(trapEntries()) end)
-		Players.PlayerRemoving:Connect(function() task.wait(0.3); trapDrop.setEntries(trapEntries()) end)
-
-		createTextBox(trapBody, "Custom Structure", "defaults to builder structure", trapCfg.CustomStructure, function(v)
-			trapCfg.CustomStructure = v; saveConfig()
-		end, "Leave empty to use the builder structure")
-		createSlider(trapBody, "Amount", 1, 20, trapCfg.Amount, 1, function(v) trapCfg.Amount = v; saveConfig() end, "Structures ringed around each target")
-
-		local function resolveTrapTargets()
-			local list = {}
+		createToggleKeybind(p, "Place Trap", false, function(v) if not v then return end
+			local nm = (trapCfg.CustomStructure ~= "" and trapCfg.CustomStructure) or buildState.StructureName
+			if not nm or nm == "" then showNotification("No structure selected!", 1.6); return end
+			if not BuildPlaceRemote then return end
+			local targets = {}
 			if trapCfg.Target == "all" then
 				for _, pl in ipairs(Players:GetPlayers()) do
-					if pl ~= LocalPlayer then table.insert(list, pl) end
+					if pl ~= LocalPlayer then table.insert(targets, pl) end
 				end
 			elseif trapCfg.Target == "nearest" then
 				local best, bd
@@ -3080,18 +2990,10 @@ createMasterUI = function()
 						end
 					end
 				end
-				if best then table.insert(list, best) end
+				if best then table.insert(targets, best) end
 			elseif typeof(trapCfg.Target) == "Instance" then
-				table.insert(list, trapCfg.Target)
+				table.insert(targets, trapCfg.Target)
 			end
-			return list
-		end
-
-		local function placeTrap()
-			local nm = (trapCfg.CustomStructure ~= "" and trapCfg.CustomStructure) or buildState.StructureName
-			if not nm or nm == "" then showNotification("No structure selected!", 1.6); return end
-			if not BuildPlaceRemote then return end
-			local targets = resolveTrapTargets()
 			if #targets == 0 then showNotification("No targets found", 1.5); return end
 			local src = getStructureByName(nm)
 			local size = 4
@@ -3101,7 +3003,7 @@ createMasterUI = function()
 			end
 			local radius = size * 0.75 + 4
 			local amount = trapCfg.Amount
-			showNotification("Trap: " .. amount .. "x " .. nm .. " on " .. #targets .. " target(s)", 2)
+			showNotification("Trap: " .. amount .. "x " .. nm, 2)
 			task.spawn(function()
 				for _, pl in ipairs(targets) do
 					local root = pl.Character and pl.Character:FindFirstChild("HumanoidRootPart")
@@ -3116,46 +3018,181 @@ createMasterUI = function()
 					end
 				end
 			end)
-		end
+		end, Enum.KeyCode.Y, "Ring structures around the target(s)")
 
-		createToggleKeybind(p, "Place Trap", false, function(v) if v then placeTrap() end end, Enum.KeyCode.Y, "Ring structures around the target(s)")
+		local _, trapBody = createExpandPanel(p, "Trap Settings", "Target, structure and amount")
+		local function trapEntries()
+			local list = {
+				{ text = "All Players", value = "all" },
+				{ text = "Nearest Player", value = "nearest" },
+				{ text = "Local Player", value = LocalPlayer },
+			}
+			for _, pl in ipairs(Players:GetPlayers()) do
+				if pl ~= LocalPlayer then
+					table.insert(list, { text = pl.DisplayName .. " (@" .. pl.Name .. ")", value = pl, image = getThumb(pl) })
+				end
+			end
+			return list
+		end
+		local trapDrop
+		trapDrop = createDropdown(trapBody, "Trap Target", trapEntries(), function(e) trapCfg.Target = e.value end,
+			{ tip = "Who to trap" })
+		Players.PlayerAdded:Connect(function() task.wait(0.5); trapDrop.setEntries(trapEntries()) end)
+		Players.PlayerRemoving:Connect(function() task.wait(0.3); trapDrop.setEntries(trapEntries()) end)
+		createTextBox(trapBody, "Custom Structure", "defaults to builder structure", trapCfg.CustomStructure, function(v)
+			trapCfg.CustomStructure = v
+		end, "Leave empty to use the builder structure")
+		createSlider(trapBody, "Amount", 1, 20, trapCfg.Amount, 1, function(v) trapCfg.Amount = v end, "Structures ringed around each target")
 
 		sectionTitle(p, "Protect Mode")
-
 		createToggleKeybind(p, "Protect Mode", protectModeActive, function(v)
 			protectModeActive = v
 			showNotification(v and "Protect Mode ACTIVE" or "Protect Mode OFF", 1.5)
-			saveConfig()
 		end, Enum.KeyCode.K, "Auto-attack players that get close")
 
-		local _, protBody = createExpandPanel(p, "Protect Settings", 272, "Custom item extras for protect mode")
-		createSlider(protBody, "Extras Radius", 5, 150, protectExtras.Radius, 1, function(v) protectExtras.Radius = v; saveConfig() end, "Radius for custom item throws")
-		createSlider(protBody, "Extras Interval", 0.2, 10, protectExtras.Interval, 0.2, function(v) protectExtras.Interval = v; saveConfig() end, "Loop delay for custom item")
-		createTextBox(protBody, "Custom Item (protect only)", "e.g. Boulder", protectExtras.CustomItem, function(v) protectExtras.CustomItem = v; saveConfig() end, "Leave empty to use the throwable only")
-		createSlider(protBody, "Custom Item Count", 1, 80, protectExtras.Count, 1, function(v) protectExtras.Count = v; saveConfig() end, "Items per protect throw")
+		local _, protBody = createExpandPanel(p, "Protect Settings", "Custom item extras for protect mode")
+		createSlider(protBody, "Extras Radius", 5, 150, protectExtras.Radius, 1, function(v) protectExtras.Radius = v end, "Radius for custom item throws")
+		createSlider(protBody, "Extras Interval", 0.2, 10, protectExtras.Interval, 0.2, function(v) protectExtras.Interval = v end, "Loop delay for custom item")
+		createTextBox(protBody, "Custom Item (protect only)", "e.g. Boulder", protectExtras.CustomItem, function(v) protectExtras.CustomItem = v end, "Leave empty to use the throwable only")
+		createSlider(protBody, "Custom Item Count", 1, 80, protectExtras.Count, 1, function(v) protectExtras.Count = v end, "Items per protect throw")
 		createTextBox(protBody, "Delay After Item", "e.g. 0.08", tostring(protectExtras.Delay), function(v)
-			local n = tonumber(v); if n then protectExtras.Delay = n; saveConfig() end
+			local n = tonumber(v); if n then protectExtras.Delay = n end
 		end, "Delay between protect throws")
 
 		sectionTitle(p, "Spread Attack")
-
-		local _, spreadBody = createExpandPanel(p, "Spread Attack Settings", 202, "Freeze in place and spam items across a circular range")
-		createSlider(spreadBody, "Range", 5, 1000, spreadCfg.Range, 10, function(v) spreadCfg.Range = v; saveConfig() end, "Radius in studs of the random spread circle")
-		createTextBox(spreadBody, "Custom Item", "defaults to current throwable", spreadCfg.CustomItem, function(v) spreadCfg.CustomItem = v; saveConfig() end, "Leave empty to use the current throwable")
-		createToggle(spreadBody, "Player Targeting Behavior", spreadCfg.TargetPlayers, function(v)
-			spreadCfg.TargetPlayers = v; saveConfig()
-			showNotification(v and "Targeting: players in range" or "Targeting: pure random", 1.4)
-		end, "Bias points onto players in range — closer players get picked far more often", false)
-		createSlider(spreadBody, "Duration", 1, 30, spreadCfg.Duration, 1, function(v) spreadCfg.Duration = v; saveConfig() end, "How long the attack spams for (seconds)")
-
 		spreadToggleRef = createToggleKeybind(p, "Spread Attack (lethal)", false, function(v)
 			if v then startSpreadAttack() else stopSpreadAttack() end
 		end, Enum.KeyCode.X, "Freezes you in place and spams the item to random points in range")
 
-		local spreadRow = make("Frame", { Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1 }, p)
-		local spreadBtn = createButton(spreadRow, "Spread Attack Now", Color3.fromRGB(150, 60, 190), "Run one full spread attack")
-		spreadBtn.Size = UDim2.new(1, 0, 1, 0)
-		spreadBtn.MouseButton1Click:Connect(function() startSpreadAttack() end)
+		local _, spreadBody = createExpandPanel(p, "Spread Attack Settings", "Range, item, targeting and duration")
+		createSlider(spreadBody, "Range", 5, 1000, spreadCfg.Range, 10, function(v) spreadCfg.Range = v end, "Radius in studs of the spread circle")
+		createTextBox(spreadBody, "Custom Item", "defaults to current throwable", spreadCfg.CustomItem, function(v) spreadCfg.CustomItem = v end, "Leave empty to use the current throwable")
+		createToggle(spreadBody, "Player Targeting Behavior", spreadCfg.TargetPlayers, function(v)
+			spreadCfg.TargetPlayers = v
+			showNotification(v and "Targeting: players in range" or "Targeting: pure random", 1.4)
+		end, "Bias points onto players in range", false)
+		createSlider(spreadBody, "Duration", 1, 30, spreadCfg.Duration, 1, function(v) spreadCfg.Duration = v end, "How long the attack spams for (seconds)")
+		local runSpread = createButton(spreadBody, "Spread Attack Now", Color3.fromRGB(150, 60, 190), "Run one full spread attack")
+		runSpread.MouseButton1Click:Connect(function() startSpreadAttack() end)
+
+		------------------------------------------------
+		-- GAME TELEPORTER
+		------------------------------------------------
+		sectionTitle(p, "Game Teleporter")
+		local _, teleBody = createExpandPanel(p, "Game Teleporter", "Search by PlaceId or game name")
+
+		local resultHolder = make("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1,
+			AutomaticSize = Enum.AutomaticSize.Y }, teleBody)
+		make("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, resultHolder)
+
+		local function clearResults()
+			resultHolder:ClearAllChildren()
+			make("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, resultHolder)
+		end
+
+		local function statusLine(text)
+			local l = make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
+				Font = Enum.Font.GothamMedium, Text = text, TextColor3 = T.Dim, TextSize = 10,
+				TextXAlignment = Enum.TextXAlignment.Left }, resultHolder)
+			return l
+		end
+
+		local function addResultCard(info)
+			local card = make("TextButton", { Size = UDim2.new(1, 0, 0, 62), BackgroundColor3 = T.Panel,
+				Text = "", AutoButtonColor = false, ClipsDescendants = true }, resultHolder)
+			corner(card, 9); local cs = stroke(card, T.Stroke, 0.5)
+			hover(card, T.Panel, T.Hover, cs)
+			card.MouseButton1Down:Connect(function() ripple(card) end)
+			card.MouseButton1Click:Connect(function()
+				playClick()
+				showNotification("Teleporting to " .. info.name .. "...", 2)
+				task.spawn(function()
+					local ok = pcall(function() TeleportService:Teleport(info.placeId, LocalPlayer) end)
+					if not ok then pcall(function() TeleportService:TeleportToPlaceInstance(info.placeId, nil, LocalPlayer) end) end
+				end)
+			end)
+
+			local thumb = make("ImageLabel", { Size = UDim2.new(0, 46, 0, 46), Position = UDim2.new(0, 8, 0.5, -23),
+				BackgroundColor3 = T.Field, Image = "", ZIndex = 2 }, card)
+			corner(thumb, 7); stroke(thumb, T.Stroke, 0.5)
+
+			local name = make("TextLabel", { Size = UDim2.new(1, -70, 0, 18), Position = UDim2.new(0, 62, 0, 12),
+				BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = info.name or "Unknown",
+				TextColor3 = T.Text, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd }, card)
+			local sub = make("TextLabel", { Size = UDim2.new(1, -70, 0, 14), Position = UDim2.new(0, 62, 0, 32),
+				BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
+				Text = ("PlaceId %d"):format(info.placeId) .. (info.players and ("   •   %d playing"):format(info.players) or ""),
+				TextColor3 = T.Dim, TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left }, card)
+
+			task.spawn(function()
+				local iconUrl = ("https://thumbnails.roblox.com/v1/places/gameicons?placeIds=%d&size=150x150&format=Png&isCircular=false"):format(info.placeId)
+				local data = httpJson(iconUrl)
+				local url = data and data.data and data.data[1] and data.data[1].imageUrl
+				if url and thumb.Parent then thumb.Image = url end
+			end)
+			return card
+		end
+
+		local function doSearch(query)
+			query = tostring(query or ""):gsub("^%s+", ""):gsub("%s+$", "")
+			if query == "" then showNotification("Enter a PlaceId or game name", 1.6); return end
+			clearResults()
+			local asId = tonumber(query)
+
+			if asId then
+				local placeId = math.floor(asId)
+				statusLine("Resolving PlaceId " .. placeId .. "...")
+				task.spawn(function()
+					local name = "Place " .. placeId
+					pcall(function()
+						local info = MarketplaceService:GetProductInfo(placeId, Enum.InfoType.Asset)
+						if info and info.Name then name = info.Name end
+					end)
+					clearResults()
+					addResultCard({ name = name, placeId = placeId })
+					syncPanels()
+				end)
+				return
+			end
+
+			statusLine("Searching \"" .. query .. "\"...")
+			task.spawn(function()
+				local url = "https://games.roblox.com/v1/games/list?model.keyword=" ..
+					HttpService:UrlEncode(query) .. "&model.maxRows=12"
+				local data = httpJson(url)
+				local games = data and data.games
+				if not games or #games == 0 then
+					clearResults()
+					statusLine("No results for \"" .. query .. "\"")
+					syncPanels()
+					return
+				end
+				clearResults()
+				local shown = 0
+				for _, g in ipairs(games) do
+					if shown >= 6 then break end
+					local placeId = g.placeId or g.rootPlaceId
+					if not placeId and g.id then
+						local res = httpJson("https://games.roblox.com/v1/games?universeIds=" .. tostring(g.id))
+						local entry = res and res.data and res.data[1]
+						placeId = entry and entry.rootPlaceId
+					end
+					if placeId then
+						shown += 1
+						addResultCard({ name = g.name, placeId = placeId, players = g.playerCount })
+					end
+				end
+				if shown == 0 then statusLine("No usable results") end
+				syncPanels()
+			end)
+		end
+
+		local searchBox = createTextBox(teleBody, "PlaceId or Game Name", "e.g. 18193096685 or Early Dawn", "", function(v)
+			doSearch(v)
+		end, "Press Enter in the box to search")
+		local goBtn = createButton(teleBody, "Search", Color3.fromRGB(41, 128, 185), "Look up the game")
+		goBtn.MouseButton1Click:Connect(function() doSearch(searchBox.Text) end)
 	end
 
 	------------------------------------------------
@@ -3163,22 +3200,73 @@ createMasterUI = function()
 	------------------------------------------------
 	do
 		local p = PAGE.Settings
-		sectionTitle(p, "Session")
+		sectionTitle(p, "Keybinds")
 
-		createToggle(p, "Relaunch on rejoin of the same game", settingsCfg.RelaunchOnRejoin, function(v)
-			settingsCfg.RelaunchOnRejoin = v
+		createToggle(p, "Enable Keybinds", keybindsEnabled, function(v)
+			keybindsEnabled = v
+			showNotification(v and "Keybinds enabled" or "All keybinds disabled", 1.6)
+		end, "Master switch for every keybind", false)
+
+		local function keybindEntries()
+			local names = {}
+			for act in pairs(keybinds) do table.insert(names, act) end
+			table.sort(names)
+			local list = {}
+			for _, act in ipairs(names) do
+				local key = keybinds[act]
+				local bound = key and key ~= Enum.KeyCode.Unknown
+				table.insert(list, {
+					text = (bound and ("[" .. key.Name .. "]   ") or "[  ]   ") .. act,
+					value = act,
+					color = bound and T.Text or T.Dim,
+				})
+			end
+			if #list == 0 then table.insert(list, { text = "no bindable rows yet", value = "none", color = T.Dim }) end
+			return list
+		end
+
+		local modDrop
+		modDrop = createDropdown(p, "Modify Keybind", keybindEntries(), function(e)
+			if e.value == "none" then return end
+			beginListen(e.value)
+		end, { tip = "Select an action, then press the key you want", onToggle = function(open)
+			if open then modDrop.setEntries(keybindEntries()) end
+		end })
+
+		local remDrop
+		remDrop = createDropdown(p, "Remove Keybind(s)", keybindEntries(), function(e)
+			if e.value == "none" then return end
+			keybinds[e.value] = Enum.KeyCode.Unknown
+			refreshKeyVisual(e.value)
+			remDrop.setEntries(keybindEntries())
 			saveConfig()
-			showNotification(v and "Will relaunch on rejoin" or "Relaunch on rejoin OFF", 1.6)
-		end, "Remember this session and re-apply your saved config when you rejoin this place", false)
+			showNotification("Removed keybind: " .. e.value, 1.4)
+		end, { tip = "Click any entry to unbind it", keepOpen = true, onToggle = function(open)
+			if open then remDrop.setEntries(keybindEntries()) end
+		end })
 
-		make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
-			Text = string.format("Place: %d   Server: %s", game.PlaceId, string.sub(game.JobId, 1, 8)),
-			TextColor3 = T.Dim, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left }, p)
+		local clearRow = make("Frame", { Size = UDim2.new(1, 0, 0, 32), BackgroundTransparency = 1 }, p)
+		local clearBtn = createButton(clearRow, "Clear All Keybinds", Color3.fromRGB(140, 50, 60), "Unbind every action")
+		clearBtn.Size = UDim2.new(1, 0, 1, 0)
+		clearBtn.MouseButton1Click:Connect(function()
+			for act in pairs(keybinds) do keybinds[act] = Enum.KeyCode.Unknown end
+			refreshAllKeyVisuals()
+			modDrop.setEntries(keybindEntries())
+			remDrop.setEntries(keybindEntries())
+			saveConfig()
+			showNotification("All keybinds cleared", 1.6)
+		end)
+
+		local _, extraBody = createExpandPanel(p, "Extra Keybinds", "Special actions")
+		local minKeyBtn = createButton(extraBody, "Minimize / Expand Menu", Color3.fromRGB(41, 128, 185), "Bind a key to collapse the menu")
+		minKeyBtn.MouseButton1Click:Connect(function() beginListen("Minimize Menu") end)
+		local uiKeyBtn = createButton(extraBody, "Hide / Show Menu", Color3.fromRGB(41, 128, 185), "Bind a key to hide the whole UI")
+		uiKeyBtn.MouseButton1Click:Connect(function() beginListen("Toggle UI") end)
 
 		sectionTitle(p, "Config")
 
 		local saveRow = make("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, p)
-		local saveBtn = createButton(saveRow, "Save Config", Color3.fromRGB(38, 110, 60), "Write keybinds, theme and settings to disk right now")
+		local saveBtn = createButton(saveRow, "Save Config", Color3.fromRGB(38, 110, 60), "Write keybinds and theme to disk")
 		saveBtn.Size = UDim2.new(1, -38, 1, 0)
 		saveBtn.MouseButton1Click:Connect(function()
 			if not HAS_FS then showNotification("Executor has no file functions", 2); return end
@@ -3199,44 +3287,42 @@ createMasterUI = function()
 			showNotification(removed and "Saved config deleted" or "No saved config found", 1.5)
 		end)
 
-		createToggle(p, "Auto Save", settingsCfg.AutoSave, function(v)
-			settingsCfg.AutoSave = v
-			if v then saveConfig(true) end
-			showNotification(v and "Auto Save ON" or "Auto Save OFF - use Save Config", 1.6)
-		end, "Write to disk automatically whenever you change something", false)
+		make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
+			Text = "Only keybinds and theme are written to disk.",
+			TextColor3 = T.Dim, TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left }, p)
 
-		-- keep the Save button honest about pending changes
 		onDirtyChanged = function()
 			saveBtn.Text = saveDirty and "Save Config  •" or "Save Config"
 			saveBtn.BackgroundColor3 = saveDirty and Color3.fromRGB(58, 132, 72) or Color3.fromRGB(38, 110, 60)
 		end
 		onDirtyChanged()
 
+		sectionTitle(p, "Interface")
+
+		local _, uiBody = createExpandPanel(p, "Interface Settings", "Minimise size and layout")
+		local scaleLbl = make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
+			Font = Enum.Font.GothamMedium, Text = "Minimised square size — " .. minimizeScale .. "%",
+			TextColor3 = T.Dim, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left }, uiBody)
+		local scaleSlider = createSlider(uiBody, "Square Size %", 50, 200, minimizeScale, 5, function(v)
+			minimizeScale = v
+			scaleLbl.Text = "Minimised square size — " .. v .. "%"
+			if uiRefs.minimized and uiRefs.applyMiniSize then uiRefs.applyMiniSize() end
+		end, "How big the collapsed square is (50-200%)")
+
 		sectionTitle(p, "Theme Personalization")
-
 		make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
-			Text = "Hue / Saturation / Brightness — applied live and saved",
-			TextColor3 = T.Dim, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left }, p)
+			Text = "Every colour in the palette — applied live and saved",
+			TextColor3 = T.Dim, TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left }, p)
 
-		createColorPicker(p, "Accent", "Accent")
-		createColorPicker(p, "Accent 2", "Accent2")
-		createColorPicker(p, "Background Top", "Bg1")
-		createColorPicker(p, "Background Bottom", "Bg2")
-		createColorPicker(p, "Panel", "Panel")
-		createColorPicker(p, "Stroke", "Stroke")
-		createColorPicker(p, "Text", "Text")
+		for _, entry in ipairs(THEME_LABELS) do
+			createColorPicker(p, entry[1], entry[2])
+		end
 
-		local resetRow = make("Frame", { Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1 }, p)
+		local resetRow = make("Frame", { Size = UDim2.new(1, 0, 0, 32), BackgroundTransparency = 1 }, p)
 		local resetBtn = createButton(resetRow, "Reset Theme To Default", Color3.fromRGB(120, 70, 190), "Restore the stock blue/purple theme")
 		resetBtn.Size = UDim2.new(1, 0, 1, 0)
 		resetBtn.MouseButton1Click:Connect(function()
-			T.Bg1 = Color3.fromRGB(30, 22, 70); T.Bg2 = Color3.fromRGB(6, 6, 14)
-			T.Panel = Color3.fromRGB(20, 26, 60); T.PanelD = Color3.fromRGB(13, 17, 40)
-			T.Hover = Color3.fromRGB(40, 52, 120); T.Field = Color3.fromRGB(15, 18, 35)
-			T.Stroke = Color3.fromRGB(100, 130, 255); T.Text = Color3.fromRGB(230, 240, 255)
-			T.Dim = Color3.fromRGB(140, 160, 200); T.Accent = Color3.fromRGB(120, 170, 255)
-			T.Accent2 = Color3.fromRGB(180, 130, 255); T.Good = Color3.fromRGB(80, 240, 130)
-			T.Bad = Color3.fromRGB(255, 95, 115); T.Warn = Color3.fromRGB(255, 205, 90)
+			for k, v in pairs(THEME_DEFAULTS) do T[k] = v end
 			applyThemeLive(); saveConfig()
 			showNotification("Theme reset", 1.5)
 			task.delay(0.25, function() createMasterUI() end)
@@ -3244,8 +3330,18 @@ createMasterUI = function()
 	end
 
 	------------------------------------------------
-	-- RESIZE GRIP + DRAG + MINIMIZE
+	-- MINIMIZE (square) / DRAG / RESIZE
 	------------------------------------------------
+	local function miniSize()
+		return math.clamp(math.floor(56 * (minimizeScale / 100)), 28, 140)
+	end
+	uiRefs.applyMiniSize = function()
+		if not uiRefs.minimized then return end
+		local s = miniSize()
+		main.Size = UDim2.fromOffset(s, s)
+		glow.Size = UDim2.fromOffset(s, s)
+	end
+
 	local grip = make("TextButton", { Size = UDim2.new(0, 20, 0, 20), Position = UDim2.new(1, -20, 1, -20),
 		BackgroundTransparency = 1, Text = "", ZIndex = 8 }, main)
 	for i = 1, 3 do
@@ -3255,6 +3351,7 @@ createMasterUI = function()
 	local resizing, rStart, rStartSize
 	grip.InputBegan:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			if uiRefs.minimized then return end
 			resizing = true; rStart = i.Position; rStartSize = main.Size
 		end
 	end)
@@ -3271,41 +3368,76 @@ createMasterUI = function()
 	end)
 
 	local dragging, dragStart, startPos
-	titleBar.InputBegan:Connect(function(i)
+	local function beginDrag(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
 			dragging = true; dragStart = i.Position; startPos = main.Position
 			i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end)
 		end
-	end)
+	end
+	titleBar.InputBegan:Connect(beginDrag)
+	miniLogo.InputBegan:Connect(beginDrag)
 	local dragInput
 	UserInputService.InputChanged:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then dragInput = i end
 	end)
 	RunService.RenderStepped:Connect(function()
-		if dragging and dragInput then
+		if dragging and dragInput and dragStart and startPos then
 			local d = dragInput.Position - dragStart
 			local np = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
 			main.Position = np; glow.Position = np
 		end
 	end)
 
-	local minimized = false
-	minBtn.MouseButton1Click:Connect(function()
-		minimized = not minimized
-		uiRefs.minimized = minimized
-		if minimized then
-			minBtn.Text = "+"; body.Visible = false
-			TweenService:Create(main, TweenInfo.new(0.26, Enum.EasingStyle.Quad), { Size = MINIMIZED }):Play()
-			TweenService:Create(glow, TweenInfo.new(0.26, Enum.EasingStyle.Quad), { Size = MINIMIZED }):Play()
+	local function toggleMinimize(force)
+		local want = force ~= nil and force or not uiRefs.minimized
+		if want == uiRefs.minimized then return end
+		uiRefs.minimized = want
+		local ti = TweenInfo.new(0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+		if want then
+			body.Visible = false
+			titleBar.Visible = false
+			grip.Visible = false
+			miniLogo.Visible = true
+			local s = miniSize()
+			TweenService:Create(main, ti, { Size = UDim2.fromOffset(s, s) }):Play()
+			TweenService:Create(glow, ti, { Size = UDim2.fromOffset(s, s) }):Play()
 		else
-			minBtn.Text = "-"; body.Visible = true
-			TweenService:Create(main, TweenInfo.new(0.26, Enum.EasingStyle.Quad), { Size = currentNormal }):Play()
-			TweenService:Create(glow, TweenInfo.new(0.26, Enum.EasingStyle.Quad), { Size = currentNormal }):Play()
+			body.Visible = true
+			titleBar.Visible = true
+			grip.Visible = true
+			miniLogo.Visible = false
+			TweenService:Create(main, ti, { Size = currentNormal }):Play()
+			TweenService:Create(glow, ti, { Size = currentNormal }):Play()
 		end
-	end)
+	end
+	minBtn.MouseButton1Click:Connect(function() playClick(); toggleMinimize() end)
+	keybinds["Minimize Menu"] = keybinds["Minimize Menu"] or Enum.KeyCode.M
+	keyTriggers["Minimize Menu"] = function() toggleMinimize() end
 
-	-- CLOSE: kill everything, destroy the UI, then run CLOSE_SCRIPT
-	closeBtn.MouseButton1Click:Connect(function()
+	local function toggleVisible()
+		gui.Enabled = not gui.Enabled
+		if gui.Enabled then
+			keybinds["Toggle UI"] = keybinds["Toggle UI"] or Enum.KeyCode.Escape
+		end
+	end
+	keybinds["Toggle UI"] = keybinds["Toggle UI"] or Enum.KeyCode.Escape
+	keyTriggers["Toggle UI"] = toggleVisible
+
+	-- CLOSE
+	local closeBtnReal = make("TextButton", { Size = UDim2.new(0, 22, 0, 22), Position = UDim2.new(0, 14, 0.5, -11),
+		BackgroundColor3 = Color3.fromRGB(70, 40, 55), Font = Enum.Font.GothamBold, Text = "✕",
+		TextColor3 = T.Text, TextSize = 12, AutoButtonColor = false, ZIndex = 6 }, titleBar)
+	corner(closeBtnReal, 6); stroke(closeBtnReal, T.Bad, 0.5)
+	hover(closeBtnReal, Color3.fromRGB(70, 40, 55), Color3.fromRGB(150, 55, 70))
+	addTooltip(closeBtnReal, "Close menu and disable everything")
+	-- shift the rest of the title bar along
+	titleLogo.Position = UDim2.new(0, 44, 0.5, -13)
+	titleLbl.Position = UDim2.new(0, 76, 0, 0)
+	versionLbl.Position = UDim2.new(0, 130, 0, 1)
+	userThumb.Position = UDim2.new(0, 176, 0.5, -10)
+	userLbl.Position = UDim2.new(0, 202, 0, 0)
+
+	closeBtnReal.MouseButton1Click:Connect(function()
 		playClick()
 		for _, api in pairs(toggleRefs) do pcall(function() api.set(false) end) end
 		pcall(function() if uiRefs.cancelBuild then uiRefs.cancelBuild() end end)
@@ -3319,23 +3451,14 @@ createMasterUI = function()
 		LocalPlayer.CameraMaxZoomDistance = 128
 		local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
 		if hum then hum.WalkSpeed = 16 end
-
-		pcall(function() saveConfig(true) end)   -- flush state before teardown
+		pcall(function() saveConfig(true) end)
 		showNotification("Menu closed — everything disabled", 1.8)
 		gui:Destroy()
-
-		-- <<< your loadstring goes here >>>
 		if type(CLOSE_SCRIPT) == "string" and CLOSE_SCRIPT ~= "" then
 			task.spawn(function()
-				if type(loadstring) ~= "function" then
-					warn("[Lunar] loadstring not available")
-					return
-				end
+				if type(loadstring) ~= "function" then warn("[Lunar] loadstring not available"); return end
 				local compiled, fn = pcall(loadstring, CLOSE_SCRIPT)
-				if not compiled or type(fn) ~= "function" then
-					warn("[Lunar] CLOSE_SCRIPT failed to compile")
-					return
-				end
+				if not compiled or type(fn) ~= "function" then warn("[Lunar] CLOSE_SCRIPT failed to compile"); return end
 				local ok, err = pcall(fn)
 				if not ok then warn("[Lunar] CLOSE_SCRIPT error: " .. tostring(err)) end
 			end)
@@ -3362,66 +3485,52 @@ createMasterUI = function()
 	task.spawn(function()
 		while gui.Parent do
 			TweenService:Create(mainStroke, TweenInfo.new(1.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Transparency = 0.55 }):Play()
-			TweenService:Create(glow, TweenInfo.new(1.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.85 }):Play()
+			TweenService:Create(glow, TweenInfo.new(1.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.88 }):Play()
 			task.wait(1.8)
 			TweenService:Create(mainStroke, TweenInfo.new(1.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { Transparency = 0.25 }):Play()
-			TweenService:Create(glow, TweenInfo.new(1.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.72 }):Play()
+			TweenService:Create(glow, TweenInfo.new(1.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), { BackgroundTransparency = 0.78 }):Play()
 			task.wait(1.8)
 		end
 	end)
 end
 
 ----------------------------------------------------
--- GLOBAL KEYBIND / PAGE NAV LISTENER
+-- GLOBAL KEYBIND LISTENER
 ----------------------------------------------------
 UserInputService.InputBegan:Connect(function(input, gp)
 	if gp then return end
 
 	if listeningAction then
-		if input.KeyCode ~= Enum.KeyCode.Unknown then
-			local act = listeningAction; listeningAction = nil
+		local act = listeningAction
+		if input.KeyCode == Enum.KeyCode.Backspace then
+			keybinds[act] = Enum.KeyCode.Unknown
+			showNotification("Cleared keybind: " .. act, 1.5)
+		elseif input.KeyCode ~= Enum.KeyCode.Unknown then
 			keybinds[act] = input.KeyCode
-			local ref = keyRefs[act]
-			if ref then
-				ref.Text = "[" .. input.KeyCode.Name .. "]"
-				ref.TextColor3 = T.Accent
-			end
-			saveConfig()
 			showNotification("Bound [" .. input.KeyCode.Name .. "] -> " .. act, 1.6)
 		end
+		listeningAction = nil
+		refreshKeyVisual(act)
+		saveConfig()
 		return
 	end
 
 	if UserInputService:GetFocusedTextBox() then return end
 
-	-- arrow keys: page travel while UI is open and not minimized
 	if uiRefs.gui and uiRefs.gui.Parent and not uiRefs.minimized and uiRefs.goToPage then
 		local names = { "General", "Item", "Builder", "Miscellaneous", "Settings" }
 		local idx = table.find(names, currentPageName) or 1
 		if input.KeyCode == Enum.KeyCode.Up then
-			uiRefs.goToPage(names[math.max(idx - 1, 1)])
-			return
+			uiRefs.goToPage(names[math.max(idx - 1, 1)]); return
 		elseif input.KeyCode == Enum.KeyCode.Down then
-			uiRefs.goToPage(names[math.min(idx + 1, #names)])
-			return
+			uiRefs.goToPage(names[math.min(idx + 1, #names)]); return
 		end
 	end
 
+	if not keybindsEnabled then return end
 	for act, key in pairs(keybinds) do
-		if key ~= Enum.KeyCode.Unknown and input.KeyCode == key and keyTriggers[act] then
+		if key and key ~= Enum.KeyCode.Unknown and input.KeyCode == key and keyTriggers[act] then
 			keyTriggers[act]()
-		end
-	end
-end)
-
-----------------------------------------------------
--- AUTO SAVE SAFETY FLUSH
-----------------------------------------------------
-task.spawn(function()
-	while true do
-		task.wait(45)
-		if settingsCfg.AutoSave and saveDirty and HAS_FS then
-			saveConfig(true)
 		end
 	end
 end)
@@ -3432,9 +3541,6 @@ end)
 showLoadingScreen(function()
 	applyStartupFlags()
 	createMasterUI()
-	if wasRejoin then
-		showNotification("Relaunched on rejoin — config restored", 2.5)
-	end
 	saveConfig()
 end)
 
@@ -3443,5 +3549,5 @@ LocalPlayer.CharacterAdded:Connect(function(ch)
 	pcall(setupAllItemsAsThrowables)
 	createMasterUI()
 	local hum = ch:FindFirstChildOfClass("Humanoid")
-	if hum then hum.WalkSpeed = walkBoostActive and walkSpeedValue or 17 end
+	if hum then hum.WalkSpeed = walkBoostActive and walkSpeedValue or 16 end
 end)
