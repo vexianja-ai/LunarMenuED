@@ -1,5 +1,9 @@
 --[[
-	LUNAR MENU — v2.1.4
+	LUNAR MENU — v2.1.5
+	+ keybind button is now a square keycap instead of a rectangle
+	+ click the minimised square to expand it (dragging still repositions)
+	+ resize corner brackets are hidden while minimised
+	+ Settings "Extra Keybinds" are now plain rows, not a dropdown/panel
 	+ FIX: keybind button was a TextButton (no Image property) -> ImageButton + child label
 	+ keybinds are now manual: [+] next to each row -> press a key -> keycap image + key text
 	+ config on disk is ONLY keybinds + theme (lean save)
@@ -227,7 +231,7 @@ end
 ----------------------------------------------------
 local LOGO_ID = "rbxassetid://8498174594"
 local KEYBIND_IMG = "rbxassetid://126810011338788"
-local VERSION = "v2.1.4"
+local VERSION = "v2.1.5"
 
 local function make(class, props, parent)
 	local i = Instance.new(class)
@@ -1380,9 +1384,11 @@ createMasterUI = function()
 	local scan = make("Frame", { Size = UDim2.new(1, -20, 0, 2), Position = UDim2.new(0, 10, 0, 46),
 		BackgroundColor3 = T.Accent2, BackgroundTransparency = 0.75, BorderSizePixel = 0, ZIndex = 3 }, main)
 
+	local resizeDecor = {}
 	for _, pos in ipairs({ UDim2.new(0, 6, 1, -22), UDim2.new(1, -22, 1, -22) }) do
 		local b = make("Frame", { Size = UDim2.new(0, 16, 0, 16), Position = pos, BackgroundTransparency = 1, ZIndex = 4 }, main)
 		stroke(b, T.Accent, 0.35, 2)
+		table.insert(resizeDecor, b)
 	end
 
 	local miniLogo = make("ImageLabel", { Size = UDim2.new(1, -14, 1, -14), AnchorPoint = Vector2.new(0.5, 0.5),
@@ -1524,13 +1530,15 @@ createMasterUI = function()
 		local keyBtn, keyTxt
 		if not IS_MOBILE then
 			-- ImageButton: TextButton has NO Image property. Child label carries the key name.
-			keyBtn = make("ImageButton", { Size = UDim2.new(0, 50, 0, 20), Position = UDim2.new(1, -104, 0.5, -10),
-				BackgroundColor3 = T.Field, Image = "", ImageTransparency = 1,
+			-- Square keycap, aspect preserved by ScaleType.Fit.
+			keyBtn = make("ImageButton", { Size = UDim2.new(0, 22, 0, 22), Position = UDim2.new(1, -110, 0.5, -11),
+				BackgroundColor3 = T.Field, Image = "", ImageTransparency = 1, ScaleType = Enum.ScaleType.Fit,
 				AutoButtonColor = false, ZIndex = 3, ClipsDescendants = false }, row)
 			corner(keyBtn, 5); stroke(keyBtn, T.Stroke, 0.55)
 			keyTxt = make("TextLabel", { Name = "KeyText", Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1,
-				Font = Enum.Font.GothamBold, Text = "+", TextColor3 = T.Accent, TextSize = 9,
+				Font = Enum.Font.GothamBold, Text = "+", TextColor3 = T.Accent, TextSize = 9, TextScaled = true,
 				ZIndex = 4, TextStrokeTransparency = 0.55, TextStrokeColor3 = Color3.new(0, 0, 0) }, keyBtn)
+			make("UITextSizeConstraint", { MaxTextSize = 9, MinTextSize = 5 }, keyTxt)
 
 			keybinds[label] = keybinds[label] or defaultKey or Enum.KeyCode.Unknown
 			keyRefs[label] = { btn = keyBtn, txt = keyTxt }
@@ -1595,6 +1603,56 @@ createMasterUI = function()
 
 	local function createToggle(parent, label, initial, onChange, tip, register)
 		return createToggleKeybind(parent, label, initial, onChange, Enum.KeyCode.Unknown, tip, register)
+	end
+
+	-- Plain keybind row (no on/off switch) — used for the extra menu keybinds
+	local function createKeybindRow(parent, label, defaultKey, tip, onPress)
+		local row = make("TextButton", { Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = T.Panel, Text = "",
+			AutoButtonColor = false, ClipsDescendants = true }, parent)
+		corner(row, 9); local s = stroke(row, T.Stroke, 0.45); hover(row, T.Panel, T.Hover, s)
+
+		make("TextLabel", { Size = UDim2.new(1, -60, 1, 0), Position = UDim2.new(0, 12, 0, 0),
+			BackgroundTransparency = 1, Font = Enum.Font.GothamSemibold, Text = label, TextColor3 = T.Text,
+			TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd }, row)
+
+		local keyBtn, keyTxt
+		if not IS_MOBILE then
+			keyBtn = make("ImageButton", { Size = UDim2.new(0, 22, 0, 22), Position = UDim2.new(1, -34, 0.5, -11),
+				BackgroundColor3 = T.Field, Image = "", ImageTransparency = 1, ScaleType = Enum.ScaleType.Fit,
+				AutoButtonColor = false, ZIndex = 3, ClipsDescendants = false }, row)
+			corner(keyBtn, 5); stroke(keyBtn, T.Stroke, 0.55)
+			keyTxt = make("TextLabel", { Name = "KeyText", Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1,
+				Font = Enum.Font.GothamBold, Text = "+", TextColor3 = T.Accent, TextSize = 9, TextScaled = true,
+				ZIndex = 4, TextStrokeTransparency = 0.55, TextStrokeColor3 = Color3.new(0, 0, 0) }, keyBtn)
+			make("UITextSizeConstraint", { MaxTextSize = 9, MinTextSize = 5 }, keyTxt)
+
+			keybinds[label] = keybinds[label] or defaultKey or Enum.KeyCode.Unknown
+			keyRefs[label] = { btn = keyBtn, txt = keyTxt }
+			refreshKeyVisual(label)
+
+			keyBtn.MouseButton1Down:Connect(function() ripple(keyBtn) end)
+			keyBtn.MouseButton1Click:Connect(function() playClick(); beginListen(label) end)
+			keyBtn.MouseButton2Click:Connect(function()
+				keybinds[label] = Enum.KeyCode.Unknown
+				refreshKeyVisual(label); saveConfig()
+				showNotification("Cleared keybind: " .. label, 1.4)
+			end)
+			addTooltip(keyBtn, "Click to bind a key  •  Right-click to clear")
+		end
+
+		row.MouseButton1Down:Connect(function() ripple(row) end)
+		row.MouseButton1Click:Connect(function()
+			if keyBtn and keyBtn.Parent then
+				local mp = UserInputService:GetMouseLocation()
+				local ap, as = keyBtn.AbsolutePosition, keyBtn.AbsoluteSize
+				if mp.X >= ap.X and mp.X <= ap.X + as.X and mp.Y >= ap.Y and mp.Y <= ap.Y + as.Y then return end
+			end
+			playClick(); beginListen(label)
+		end)
+		if tip then addTooltip(row, tip) end
+
+		keyTriggers[label] = function() if onPress then onPress() end end
+		return row
 	end
 
 	------------------------------------------------
@@ -3249,11 +3307,14 @@ createMasterUI = function()
 			showNotification("All keybinds cleared", 1.6)
 		end)
 
-		local _, extraBody = createExpandPanel(p, "Extra Keybinds", "Special actions")
-		local minKeyBtn = createButton(extraBody, "Minimize / Expand Menu", Color3.fromRGB(41, 128, 185), "Bind a key to collapse the menu")
-		minKeyBtn.MouseButton1Click:Connect(function() beginListen("Minimize Menu") end)
-		local uiKeyBtn = createButton(extraBody, "Hide / Show Menu", Color3.fromRGB(41, 128, 185), "Bind a key to hide the whole UI")
-		uiKeyBtn.MouseButton1Click:Connect(function() beginListen("Toggle UI") end)
+		-- plain rows, no dropdown / expand panel
+		sectionTitle(p, "Extra Keybinds")
+		createKeybindRow(p, "Minimize Menu", Enum.KeyCode.M, "Collapse or expand the menu", function()
+			if uiRefs.toggleMinimize then uiRefs.toggleMinimize() end
+		end)
+		createKeybindRow(p, "Toggle UI", Enum.KeyCode.Escape, "Hide or show the whole UI", function()
+			if uiRefs.toggleVisible then uiRefs.toggleVisible() end
+		end)
 
 		sectionTitle(p, "Config")
 
@@ -3389,6 +3450,7 @@ createMasterUI = function()
 			body.Visible = false
 			titleBar.Visible = false
 			grip.Visible = false
+			for _, d in ipairs(resizeDecor) do d.Visible = false end
 			miniLogo.Visible = true
 			local s = miniSize()
 			TweenService:Create(main, ti, { Size = UDim2.fromOffset(s, s) }):Play()
@@ -3397,20 +3459,39 @@ createMasterUI = function()
 			body.Visible = true
 			titleBar.Visible = true
 			grip.Visible = true
+			for _, d in ipairs(resizeDecor) do d.Visible = true end
 			miniLogo.Visible = false
 			TweenService:Create(main, ti, { Size = currentNormal }):Play()
 			TweenService:Create(glow, ti, { Size = currentNormal }):Play()
 		end
 	end
 	minBtn.MouseButton1Click:Connect(function() playClick(); toggleMinimize() end)
+
+	-- click the minimised square to expand (drag still repositions it)
+	local miniPressAt = nil
+	miniLogo.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			miniPressAt = i.Position
+		end
+	end)
+	miniLogo.InputEnded:Connect(function(i)
+		if miniPressAt and (i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch) then
+			local moved = (i.Position - miniPressAt).Magnitude
+			miniPressAt = nil
+			if moved < 6 then playClick(); toggleMinimize(false) end
+		end
+	end)
+
 	keybinds["Minimize Menu"] = keybinds["Minimize Menu"] or Enum.KeyCode.M
 	keyTriggers["Minimize Menu"] = function() toggleMinimize() end
+	uiRefs.toggleMinimize = toggleMinimize
 
 	local function toggleVisible()
 		gui.Enabled = not gui.Enabled
 	end
 	keybinds["Toggle UI"] = keybinds["Toggle UI"] or Enum.KeyCode.Escape
 	keyTriggers["Toggle UI"] = toggleVisible
+	uiRefs.toggleVisible = toggleVisible
 
 	-- CLOSE
 	closeBtnReal.MouseButton1Click:Connect(function()
