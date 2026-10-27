@@ -1,20 +1,16 @@
 --[[
-	LUNAR MENU — v2.2.0
-	+ Walk Speed is now a text box and is applied via a __newindex hook (0 is preserved for drink locks)
-	+ No Jump Cooldown: SetStateEnabled(Jumping) is forced true via hook
-	+ Structure ESP (General) with Ignore self-structures + saved fill/outline/text colours
-	+ Builder: Auto Complete Structures switch + "Auto Complete Near Structures" button
-	+ Item Stats editor (Miscellaneous): pick any item, edit every key of its table live
-	+ Wellness + Trap target dropdowns are multi-select with All / Others / Nearest
-	+ God sim now flags every missing critical function, not just checkcaller
-	+ FIX: minimised square keeps the menu's centre; expanding returns it to the same spot
-	+ FIX: stale drag input made the window jump on the first frame of a drag
-	+ GOD WEAPON Simulation (Miscellaneous)
-	+ keybind keycap is a square
-	+ click the minimised square to expand it (dragging still repositions)
-	+ resize corner brackets hidden while minimised
-	+ Settings "Extra Keybinds" are plain rows, not a dropdown/panel
-	+ config on disk is keybinds + theme + ESP colours
+	LUNAR MENU — v2.3.0
+	+ Auto Complete rewritten: prompts forced to HoldDuration 0, BuildBlueprintAdd fired directly
+	    (5 materials x 4 rounds per stage, 8 rounds for Thatch Hut / Mud, skips Fiber Basket & Fire Pit)
+	    "not" -> "can" interceptor kept as a fallback for manual presses
+	+ Animal ESP off Heartbeat, throttled, no Workspace-wide descendant scan
+	+ Every ESP (player / animal / structure) has saved fill, outline and text colours
+	+ Minimise uses its own ScreenGui square; the real window is parked and restored exactly
+	+ Miscellaneous: Make Mobile Buttons Draggable + Save Button Position + Cancel
+	+ Walk Speed text box applied through a __newindex hook (0 preserved)
+	+ No Jump Cooldown via SetStateEnabled hook
+	+ Structure ESP, GOD WEAPON simulation, Item Stats editor
+	+ Wellness / Trap dropdowns multi-select with All / Others / Nearest
 ]]--
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -142,9 +138,15 @@ local espShowHealth = false
 local espFriendsOnly = false
 
 local espColors = {
-	StructureFill = Color3.fromRGB(90, 200, 255),
+	PlayerFill       = Color3.fromRGB(255, 60, 60),
+	PlayerOutline    = Color3.fromRGB(255, 255, 255),
+	PlayerText       = Color3.fromRGB(140, 200, 255),
+	AnimalFill       = Color3.fromRGB(90, 220, 140),
+	AnimalOutline    = Color3.fromRGB(255, 255, 255),
+	AnimalText       = Color3.fromRGB(190, 255, 210),
+	StructureFill    = Color3.fromRGB(90, 200, 255),
 	StructureOutline = Color3.fromRGB(255, 255, 255),
-	StructureText = Color3.fromRGB(200, 235, 255),
+	StructureText    = Color3.fromRGB(200, 235, 255),
 }
 
 local walkSpeedValue = 60
@@ -153,6 +155,9 @@ local noJumpCooldown = true
 
 local autoCompleteStructures = false
 local autoCompleteBurst = false
+
+local mobileDragActive = false
+local mobileButtonSnapshot = {}
 
 local changeValueMode = "add"
 local minimizeScale = 100
@@ -244,7 +249,7 @@ end
 ----------------------------------------------------
 local LOGO_ID = "rbxassetid://8498174594"
 local KEYBIND_IMG = "rbxassetid://126810011338788"
-local VERSION = "v2.2.0"
+local VERSION = "v2.3.0"
 
 local function make(class, props, parent)
 	local i = Instance.new(class)
@@ -376,6 +381,19 @@ local buildState = {
 	ViewportViewModel = nil,
 	ViewportCharModel = nil
 }
+
+----------------------------------------------------
+-- AUTO COMPLETE CONFIG
+----------------------------------------------------
+local AUTO_MATERIALS = { "Stick", "Fiber", "Rope Fiber", "Mud", "Branch" }
+local AUTO_SKIP = { ["Fiber Basket"] = true, ["Fire Pit"] = true }
+local AUTO_ROUNDS_DEFAULT = 4
+local AUTO_ROUNDS_HEAVY = 8
+local AUTO_HEAVY = { ["Thatch Hut"] = true, ["Mud"] = true }
+
+local function autoRoundsFor(name)
+	return AUTO_HEAVY[name] and AUTO_ROUNDS_HEAVY or AUTO_ROUNDS_DEFAULT
+end
 
 ----------------------------------------------------
 -- CORE HELPERS
@@ -608,7 +626,7 @@ local function isFriend(plr)
 end
 
 local function createBillboard(character, tag)
-	local head = character:FindFirstChild("Head")
+	local head = character:FindFirstChild("Head") or character:FindFirstChildWhichIsA("BasePart")
 	if not head then return nil end
 	local billboard = Instance.new("BillboardGui", character)
 	billboard.Name = tag
@@ -673,6 +691,21 @@ end
 
 local function getAnimalFolder() return Workspace:FindFirstChild("Animals") end
 
+local function forEachAnimal(fn)
+	local folder = getAnimalFolder()
+	if folder then
+		for _, d in ipairs(folder:GetDescendants()) do
+			if d:IsA("Model") and d:FindFirstChildOfClass("Humanoid") then fn(d) end
+		end
+	else
+		for _, d in ipairs(Workspace:GetChildren()) do
+			if d:IsA("Model") and d:FindFirstChildOfClass("Humanoid") and not Players:GetPlayerFromCharacter(d) then
+				fn(d)
+			end
+		end
+	end
+end
+
 local function getAnimalGroups()
 	local folder = getAnimalFolder()
 	local counts = {}
@@ -695,16 +728,7 @@ local function getAnimalGroups()
 	return list
 end
 
-local function forEachAnimal(fn)
-	local folder = getAnimalFolder()
-	local scan = folder or Workspace
-	for _, d in ipairs(scan:GetDescendants()) do
-		if d:IsA("Model") and d:FindFirstChildOfClass("Humanoid") then
-			if not Players:GetPlayerFromCharacter(d) then fn(d) end
-		end
-	end
-end
-
+-- player ESP (cheap, stays on Heartbeat)
 RunService.Heartbeat:Connect(function()
 	if fullBrightActive then
 		if Lighting.ClockTime < 6 or Lighting.ClockTime > 18 then
@@ -712,52 +736,63 @@ RunService.Heartbeat:Connect(function()
 		end
 	end
 
+	if not playerEspActive then return end
 	local myChar = LocalPlayer.Character
 	local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+	if not myRoot then return end
 
-	if playerEspActive and myRoot then
-		for _, targetPlayer in ipairs(Players:GetPlayers()) do
-			if targetPlayer ~= LocalPlayer and targetPlayer.Character then
-				local targetChar = targetPlayer.Character
-				if espFriendsOnly and not isFriend(targetPlayer) then
-					removeESP(targetChar, "PlayerESP")
-				else
-					local targetHRP = targetChar:FindFirstChild("HumanoidRootPart")
-					if targetHRP and (myRoot.Position - targetHRP.Position).Magnitude <= MAX_ESP_DISTANCE then
-						local highlight = targetChar:FindFirstChild("PlayerESP_Highlight")
-						if not highlight then
-							highlight = Instance.new("Highlight", targetChar)
-							highlight.Name = "PlayerESP_Highlight"
-							highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
-							highlight.FillTransparency = 0.4
-						end
-						highlight.FillColor = (espTeamColors and targetPlayer.Team) and targetPlayer.TeamColor.Color or Color3.fromRGB(255, 50, 50)
-						local bb = targetChar:FindFirstChild("PlayerESP_Billboard")
-						if not bb then bb = createBillboard(targetChar, "PlayerESP_Billboard") end
-						local lbl = bb and bb:FindFirstChild("Label")
-						if lbl then lbl.Text = espText(targetPlayer, targetChar) end
-					else
-						removeESP(targetChar, "PlayerESP")
+	for _, targetPlayer in ipairs(Players:GetPlayers()) do
+		if targetPlayer ~= LocalPlayer and targetPlayer.Character then
+			local targetChar = targetPlayer.Character
+			if espFriendsOnly and not isFriend(targetPlayer) then
+				removeESP(targetChar, "PlayerESP")
+			else
+				local targetHRP = targetChar:FindFirstChild("HumanoidRootPart")
+				if targetHRP and (myRoot.Position - targetHRP.Position).Magnitude <= MAX_ESP_DISTANCE then
+					local highlight = targetChar:FindFirstChild("PlayerESP_Highlight")
+					if not highlight then
+						highlight = Instance.new("Highlight", targetChar)
+						highlight.Name = "PlayerESP_Highlight"
+						highlight.FillTransparency = 0.4
 					end
+					highlight.OutlineColor = espColors.PlayerOutline
+					highlight.FillColor = (espTeamColors and targetPlayer.Team) and targetPlayer.TeamColor.Color or espColors.PlayerFill
+					local bb = targetChar:FindFirstChild("PlayerESP_Billboard")
+					if not bb then bb = createBillboard(targetChar, "PlayerESP_Billboard") end
+					local lbl = bb and bb:FindFirstChild("Label")
+					if lbl then
+						lbl.Text = espText(targetPlayer, targetChar)
+						lbl.TextColor3 = espColors.PlayerText
+					end
+				else
+					removeESP(targetChar, "PlayerESP")
 				end
 			end
 		end
 	end
+end)
 
-	if animalEspActive and myRoot then
+-- animal ESP (throttled, off the heartbeat)
+task.spawn(function()
+	while task.wait(0.22) do
+		if not animalEspActive then continue end
+		local myChar = LocalPlayer.Character
+		local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+		if not myRoot then continue end
+		local origin = myRoot.Position
 		forEachAnimal(function(animal)
-			local root = animal:FindFirstChild("HumanoidRootPart") or animal.PrimaryPart
+			local root = animal.PrimaryPart or animal:FindFirstChild("HumanoidRootPart")
 			local hum = animal:FindFirstChildOfClass("Humanoid")
 			if root and hum and hum.Health > 0 and not animalIgnore[animal.Name]
-				and (root.Position - myRoot.Position).Magnitude <= ANIMAL_ESP_DISTANCE then
+				and (root.Position - origin).Magnitude <= ANIMAL_ESP_DISTANCE then
 				local highlight = animal:FindFirstChild("AnimalESP_Highlight")
 				if not highlight then
 					highlight = Instance.new("Highlight", animal)
 					highlight.Name = "AnimalESP_Highlight"
-					highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
-					highlight.FillColor = Color3.fromRGB(90, 220, 140)
 					highlight.FillTransparency = 0.4
 				end
+				highlight.OutlineColor = espColors.AnimalOutline
+				highlight.FillColor = espColors.AnimalFill
 				local bb = animal:FindFirstChild("AnimalESP_Billboard")
 				if not bb then bb = createBillboard(animal, "AnimalESP_Billboard") end
 				local lbl = bb and bb:FindFirstChild("Label")
@@ -767,6 +802,7 @@ RunService.Heartbeat:Connect(function()
 						txt = txt .. "  " .. math.floor(hum.Health) .. "/" .. math.floor(hum.MaxHealth)
 					end
 					lbl.Text = txt
+					lbl.TextColor3 = espColors.AnimalText
 				end
 			else
 				removeESP(animal, "AnimalESP")
@@ -775,7 +811,7 @@ RunService.Heartbeat:Connect(function()
 	end
 end)
 
--- Structure ESP loop (runs independently of the menu lifetime)
+-- structure ESP
 task.spawn(function()
 	while task.wait(0.4) do
 		if structEspActive then
@@ -844,9 +880,7 @@ local function ensureHookSupport()
 	end
 end
 
--- No jump cooldown: force the Jumping state to stay enabled
-local function refreshSpeedHumanoid() end
-
+-- no jump cooldown
 if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
 	local oldNC
 	oldNC = hookmetamethod(game, "__namecall", wrapClosure(function(self, ...)
@@ -861,7 +895,7 @@ if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" 
 	end))
 end
 
--- WalkSpeed override at the property write, preserving 0 (drink lock)
+-- walkspeed override at the write
 local speedHumanoid = nil
 local function refreshSpeedTarget()
 	speedHumanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid") or nil
@@ -921,7 +955,7 @@ if hookmetamethod and getnamecallmethod and newcclosure then
 	end))
 end
 
--- Auto complete blueprints: rewrite "not" -> "can"
+-- blueprint interceptor: keep every argument, swap only "not" -> "can"
 if BuildBlueprintAdd and type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
 	local oldNC
 	oldNC = hookmetamethod(game, "__namecall", wrapClosure(function(self, ...)
@@ -958,7 +992,7 @@ if ThrownSpearReplication and killConnections(ThrownSpearReplication.OnClientEve
 end
 
 ----------------------------------------------------
--- TARGET RESOLUTION (shared by wellness / trap)
+-- TARGET RESOLUTION
 ----------------------------------------------------
 local function resolveTargets(list)
 	local out, seen = {}, {}
@@ -1028,11 +1062,13 @@ local function getThumb(plr)
 end
 
 ----------------------------------------------------
--- CONFIG  (keybinds + theme + esp colours)
+-- CONFIG
 ----------------------------------------------------
 local SAVE_FOLDER = "LunarMenu"
 local SAVE_FILE = SAVE_FOLDER .. "/config.json"
 local FALLBACK_FILE = "LunarMenu_config.json"
+local MOBILE_FILE = SAVE_FOLDER .. "/mobilebuttons.json"
+local MOBILE_FALLBACK = "LunarMenu_mobilebuttons.json"
 local HAS_FS = (type(writefile) == "function" and type(readfile) == "function")
 local saveQueued = false
 local saveDirty = false
@@ -1129,6 +1165,105 @@ end
 pcall(loadConfig)
 
 ----------------------------------------------------
+-- MOBILE BUTTON DRAGGER
+----------------------------------------------------
+local function mobileButtonRoot()
+	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	local hud = pg and pg:FindFirstChild("HUD")
+	return hud and hud:FindFirstChild("MobileButtons")
+end
+
+local function mobileButtonKey(obj, root)
+	local parts = {}
+	local node = obj
+	while node and node ~= root do
+		table.insert(parts, 1, node.Name)
+		node = node.Parent
+	end
+	return table.concat(parts, "/")
+end
+
+local function collectMobileButtons()
+	local root = mobileButtonRoot()
+	if not root then return {}, nil end
+	local list = {}
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("GuiButton") then table.insert(list, d) end
+	end
+	return list, root
+end
+
+local function loadMobilePositions()
+	local root = mobileButtonRoot()
+	if not root then return 0 end
+	local raw
+	for _, path in ipairs({ MOBILE_FILE, MOBILE_FALLBACK }) do
+		if fileExists(path) then
+			local ok, r = pcall(readfile, path)
+			if ok and r and r ~= "" then raw = r; break end
+		end
+	end
+	if not raw then return 0 end
+	local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
+	if not ok or type(data) ~= "table" then return 0 end
+	local applied = 0
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("GuiButton") then
+			local p4 = data[mobileButtonKey(d, root)]
+			if type(p4) == "table" and #p4 >= 4 then
+				local okk = pcall(function() d.Position = UDim2.new(p4[1], p4[2], p4[3], p4[4]) end)
+				if okk then applied += 1 end
+			end
+		end
+	end
+	return applied
+end
+
+local function setMobileButtonsDraggable(on)
+	mobileDragActive = on
+	local list, root = collectMobileButtons()
+	if not root then showNotification("HUD.MobileButtons not found", 1.8); return end
+	if on then
+		mobileButtonSnapshot = {}
+		for _, b in ipairs(list) do
+			mobileButtonSnapshot[b] = b.Position
+			pcall(function() b.Draggable = true end)
+		end
+		local n = loadMobilePositions()
+		showNotification("Draggable ON — " .. #list .. " button(s)" .. (n > 0 and (", " .. n .. " loaded") or ""), 2)
+	else
+		for _, b in ipairs(list) do pcall(function() b.Draggable = false end) end
+		showNotification("Mobile buttons locked", 1.5)
+	end
+end
+
+local function saveMobilePositions()
+	local list, root = collectMobileButtons()
+	if not root then showNotification("HUD.MobileButtons not found", 1.8); return end
+	local out = {}
+	for _, d in ipairs(list) do
+		out[mobileButtonKey(d, root)] = { d.Position.X.Scale, d.Position.X.Offset, d.Position.Y.Scale, d.Position.Y.Offset }
+	end
+	local ok, encoded = pcall(function() return HttpService:JSONEncode(out) end)
+	if not ok or not encoded then showNotification("Encode failed", 1.6); return end
+	local target = ensureSaveFolder() and MOBILE_FILE or MOBILE_FALLBACK
+	local wrote = pcall(function() writefile(target, encoded) end)
+	if not wrote then wrote = pcall(function() writefile(MOBILE_FALLBACK, encoded) end) end
+	showNotification(wrote and ("Saved " .. #list .. " button position(s)") or "Save failed", 1.8)
+end
+
+local function cancelMobilePositions()
+	local n = 0
+	for b, pos in pairs(mobileButtonSnapshot) do
+		if b and b.Parent then
+			pcall(function() b.Position = pos end)
+			n += 1
+		end
+	end
+	showNotification(n > 0 and ("Reverted " .. n .. " button(s)") or "Nothing to revert", 1.5)
+end
+
+----------------------------------------------------
 -- STARTUP FLAGS
 ----------------------------------------------------
 local function applyStartupFlags()
@@ -1144,13 +1279,47 @@ local function applyStartupFlags()
 		LocalPlayer.CameraMinZoomDistance = 0.5
 	end
 	refreshSpeedTarget()
-	local hum = speedHumanoid
-	if hum then hum.WalkSpeed = walkBoostActive and walkSpeedValue or 12 end
+	if speedHumanoid then speedHumanoid.WalkSpeed = walkBoostActive and walkSpeedValue or 12 end
 end
 
 ----------------------------------------------------
 -- AUTO COMPLETE NEAR STRUCTURES
 ----------------------------------------------------
+local function promptInstant(prompt)
+	pcall(function() prompt.HoldDuration = 0 end)
+end
+
+local function autoCompleteStructure(model)
+	local name = model.Name
+	if AUTO_SKIP[name] then return 0, true end
+	local holder = model:FindFirstChild("prompt")
+	local prompt = holder and holder:FindFirstChild("ProximityPrompt")
+	if not prompt then return 0, false end
+	promptInstant(prompt)
+
+	local rounds = autoRoundsFor(name)
+	local fired = 0
+	for _ = 1, 60 do
+		local idx = model:GetAttribute("CurrentStageIndex")
+		if idx == nil or not model.Parent then break end
+		local stageName = "Stage" .. (idx + 1)
+		-- instant prompt trigger: makes the server create its one-shot listener
+		pcall(function() prompt:InputHoldBegin() end)
+		pcall(function() prompt:InputHoldEnd() end)
+		-- fire the remote manually, all arguments, every material, repeated
+		for _ = 1, rounds do
+			for _, mat in ipairs(AUTO_MATERIALS) do
+				if BuildBlueprintAdd then
+					BuildBlueprintAdd:FireServer("can", stageName, mat)
+					fired += 1
+				end
+			end
+		end
+		task.wait(0.06)
+	end
+	return fired, true
+end
+
 local function autoCompleteNear()
 	local ch = LocalPlayer.Character
 	local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
@@ -1161,11 +1330,12 @@ local function autoCompleteNear()
 
 	local list = {}
 	for _, m in ipairs(folder:GetDescendants()) do
-		if m:IsA("Model") and m.PrimaryPart and m:GetAttribute("CurrentStageIndex") ~= nil then
+		if m:IsA("Model") and m.PrimaryPart and m:GetAttribute("CurrentStageIndex") ~= nil
+			and not AUTO_SKIP[m.Name] then
 			local holder = m:FindFirstChild("prompt")
 			local prompt = holder and holder:FindFirstChild("ProximityPrompt")
 			if prompt then
-				local reach = (prompt.MaxActivationDistance or 10) + 4
+				local reach = (prompt.MaxActivationDistance or 10) + 6
 				if (m.PrimaryPart.Position - hrp.Position).Magnitude <= reach then
 					table.insert(list, m)
 				end
@@ -1177,26 +1347,35 @@ local function autoCompleteNear()
 	showNotification("Auto completing " .. #list .. " structure(s)...", 2)
 	autoCompleteBurst = true
 	task.spawn(function()
-		local done = 0
+		local done, total = 0, 0
 		for _, m in ipairs(list) do
-			local holder = m:FindFirstChild("prompt")
-			local prompt = holder and holder:FindFirstChild("ProximityPrompt")
-			if prompt and m.Parent then
-				for _ = 1, 40 do
-					if not m.Parent or m:GetAttribute("CurrentStageIndex") == nil then break end
-					prompt:InputHoldBegin()
-					task.wait(math.max(prompt.HoldDuration, 0.05))
-					prompt:InputHoldEnd()
-					task.wait(0.2)
-				end
-				done += 1
-			end
+			local fired = autoCompleteStructure(m)
+			total += fired
+			done += 1
 		end
 		task.wait(0.3)
 		autoCompleteBurst = false
-		showNotification("Auto complete finished (" .. done .. ")", 1.6)
+		showNotification("Auto complete: " .. done .. " structure(s), " .. total .. " remote(s)", 1.8)
 	end)
 end
+
+-- keep every structure prompt instant while the switch is on
+task.spawn(function()
+	while task.wait(1) do
+		if autoCompleteStructures then
+			local root = Workspace:FindFirstChild("Interactables")
+			local folder = root and root:FindFirstChild("Structures")
+			if folder then
+				for _, m in ipairs(folder:GetDescendants()) do
+					local holder = m:FindFirstChild("prompt")
+					local prompt = holder and holder:FindFirstChild("Prompt")
+					prompt = holder and holder:FindFirstChild("ProximityPrompt") or prompt
+					if prompt and prompt.HoldDuration ~= 0 then promptInstant(prompt) end
+				end
+			end
+		end
+	end
+end)
 
 ----------------------------------------------------
 -- SPREAD ATTACK
@@ -1368,9 +1547,7 @@ local function godItemName()
 	return currentThrowableName
 end
 
-local function godActive()
-	return god.Enabled and god.Detected
-end
+local function godActive() return god.Enabled and god.Detected end
 
 local function godIsOurCall()
 	if type(checkcaller) == "function" then
@@ -1380,9 +1557,7 @@ local function godIsOurCall()
 	return false
 end
 
-local function godShouldBlock()
-	return godActive() and not godIsOurCall()
-end
+local function godShouldBlock() return godActive() and not godIsOurCall() end
 
 local function godTargetInRange()
 	local ch = LocalPlayer.Character
@@ -1459,11 +1634,7 @@ local function godHitboxPart()
 	p.Name = "LunarGodWeaponHitbox"
 	p.Shape = Enum.PartType.Ball
 	p.Size = Vector3.new(god.Range * 2, god.Range * 2, god.Range * 2)
-	p.Anchored = true
-	p.CanCollide = false
-	p.CanQuery = false
-	p.CanTouch = false
-	p.CastShadow = false
+	p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CanTouch = false; p.CastShadow = false
 	p.Material = Enum.Material.ForceField
 	p.Color = T.Warn
 	p.Transparency = 0.8
@@ -1764,6 +1935,7 @@ end
 local createMasterUI
 createMasterUI = function()
 	if UI_PARENT:FindFirstChild("MasterControlGui") then UI_PARENT.MasterControlGui:Destroy() end
+	if UI_PARENT:FindFirstChild("LunarMini") then UI_PARENT.LunarMini:Destroy() end
 	for k in pairs(themeRegistry) do themeRegistry[k] = {} end
 	keyRefs = {}
 	panelSyncers = {}
@@ -1802,10 +1974,6 @@ createMasterUI = function()
 		stroke(b, T.Accent, 0.35, 2)
 		table.insert(resizeDecor, b)
 	end
-
-	local miniLogo = make("ImageLabel", { Size = UDim2.new(1, -14, 1, -14), AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.new(0.5, 0, 0.5, 0), BackgroundTransparency = 1, Image = LOGO_ID,
-		Visible = false, ZIndex = 7 }, main)
 
 	local tooltip = make("TextLabel", { Size = UDim2.new(0, 120, 0, 22), BackgroundColor3 = T.Panel,
 		BackgroundTransparency = 0.05, BorderSizePixel = 0, Font = Enum.Font.Gotham, Text = "",
@@ -2160,7 +2328,7 @@ createMasterUI = function()
 	end
 
 	------------------------------------------------
-	-- DROPDOWN (supports multi-select)
+	-- DROPDOWN (multi-select capable)
 	------------------------------------------------
 	local function createDropdown(parent, title, entries, onSelect, opts)
 		opts = opts or {}
@@ -2329,7 +2497,7 @@ createMasterUI = function()
 	end
 
 	------------------------------------------------
-	-- COLOR PICKER (works on any table)
+	-- COLOR PICKER (any table)
 	------------------------------------------------
 	local function createColorPicker(parent, label, key, tbl)
 		tbl = tbl or T
@@ -2621,6 +2789,9 @@ createMasterUI = function()
 		end, "Only show friends", false)
 		createSlider(espBody, "ESP Range", 50, 2000, MAX_ESP_DISTANCE, 10, function(v) MAX_ESP_DISTANCE = v end,
 			"Player ESP range in studs")
+		createColorPicker(espBody, "Fill Color", "PlayerFill", espColors)
+		createColorPicker(espBody, "Outline Color", "PlayerOutline", espColors)
+		createColorPicker(espBody, "Text Color", "PlayerText", espColors)
 
 		createToggleKeybind(p, "Fullbright", fullBrightActive, function(v)
 			fullBrightActive = v
@@ -2658,11 +2829,14 @@ createMasterUI = function()
 			saveConfig()
 		end, Enum.KeyCode.N, "Highlight animals from Workspace.Animals")
 
-		local _, animalBody = createExpandPanel(p, "Animal ESP Settings", "Range, health and ignore list")
+		local _, animalBody = createExpandPanel(p, "Animal ESP Settings", "Range, health, colours and ignore list")
 		createSlider(animalBody, "ESP Range", 50, 2000, ANIMAL_ESP_DISTANCE, 10, function(v) ANIMAL_ESP_DISTANCE = v end,
 			"Animal ESP range in studs")
 		createToggle(animalBody, "Include Health", animalEspHealth, function(v) animalEspHealth = v; saveConfig() end,
 			"Show animal health on the nametag", false)
+		createColorPicker(animalBody, "Fill Color", "AnimalFill", espColors)
+		createColorPicker(animalBody, "Outline Color", "AnimalOutline", espColors)
+		createColorPicker(animalBody, "Text Color", "AnimalText", espColors)
 
 		local function animalEntries()
 			local list = {}
@@ -2712,9 +2886,8 @@ createMasterUI = function()
 		createToggleKeybind(p, "Walk Speed Boost", walkBoostActive, function(v)
 			walkBoostActive = v
 			refreshSpeedTarget()
-			local hum = speedHumanoid
-			if hum then
-				if v then hum.WalkSpeed = walkSpeedValue else hum.WalkSpeed = 12 end
+			if speedHumanoid then
+				if v then speedHumanoid.WalkSpeed = walkSpeedValue else speedHumanoid.WalkSpeed = 12 end
 			end
 			showNotification(v and ("Walk Speed: " .. walkSpeedValue) or "Walk Speed: default", 1.4)
 		end, Enum.KeyCode.G, "Hooks WalkSpeed so the game cannot overwrite it")
@@ -2731,7 +2904,7 @@ createMasterUI = function()
 		createToggle(moveBody, "No Jump Cooldown", noJumpCooldown, function(v)
 			noJumpCooldown = v
 			showNotification(v and "No Jump Cooldown ON" or "No Jump Cooldown OFF", 1.4)
-		end, "Keeps the Jumping state enabled so the stamina/cooldown gate can't block you", false)
+		end, "Keeps the Jumping state enabled so the stamina gate can't block you", false)
 
 		sectionTitle(p, "Teleport")
 		createToggleKeybind(p, "Teleport", false, function(v)
@@ -2823,20 +2996,15 @@ createMasterUI = function()
 			return list
 		end
 
-		local wLbl = make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
+		make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
 			Font = Enum.Font.GothamMedium, Text = "Empty = Local Player. Click several to multi-select.",
 			TextColor3 = T.Dim, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left }, wBody)
 
 		local wDrop
-		wDrop = createDropdown(wBody, "Wellness Target(s)", wEntries(), function(e)
-			if e.value == "click" then
-				wellnessClickMode = true
-				showNotification("Click a player in the world", 1.6)
-			end
-		end, { tip = "Multi-select. Empty selection applies to you.", multi = true, keepOpen = true,
-			onToggle = function(open) if open then wDrop.setEntries(wEntries()) end end })
+		wDrop = createDropdown(wBody, "Wellness Target(s)", wEntries(), function() end,
+			{ tip = "Multi-select. Empty applies to you.", multi = true, keepOpen = true,
+			  onToggle = function(open) if open then wDrop.setEntries(wEntries()) end end })
 
-		-- keep a "Click To Select" entry available too
 		Players.PlayerAdded:Connect(function() task.wait(0.5); wDrop.setEntries(wEntries()) end)
 		Players.PlayerRemoving:Connect(function() task.wait(0.3); wDrop.setEntries(wEntries()) end)
 
@@ -2878,9 +3046,8 @@ createMasterUI = function()
 		tBtn.MouseButton1Down:Connect(function() ripple(tBtn) end)
 
 		local function applyWellness(folder, box)
-			local selected = wDrop.getSelected()
 			local chosen = {}
-			for v in pairs(selected) do table.insert(chosen, v) end
+			for v in pairs(wDrop.getSelected()) do table.insert(chosen, v) end
 			for _, pl in ipairs(wellnessTargets) do table.insert(chosen, pl) end
 			local targets = resolveTargets(chosen)
 			if #targets == 0 then targets = { LocalPlayer } end
@@ -3824,6 +3991,29 @@ createMasterUI = function()
 			buildStatsEditor(e.value)
 		end, { tip = "Pick an item, then edit any of its keys below" })
 		statsDrop.setEntries(itemStatsEntries())
+
+		------------------------------------------------
+		-- MOBILE BUTTONS
+		------------------------------------------------
+		sectionTitle(p, "Mobile Buttons")
+		createToggle(p, "Make Mobile Buttons Draggable", mobileDragActive, function(v)
+			setMobileButtonsDraggable(v)
+		end, "Lets you drag the game's HUD buttons around", false)
+
+		local mbRow = make("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, p)
+		local savePos = createButton(mbRow, "Save Button Position", Color3.fromRGB(38, 110, 60),
+			"Write the current button positions to disk")
+		savePos.Size = UDim2.new(0.62, 0, 1, 0)
+		savePos.MouseButton1Click:Connect(saveMobilePositions)
+		local cancelPos = createButton(mbRow, "Cancel", Color3.fromRGB(140, 50, 60),
+			"Restore the positions from before you started dragging")
+		cancelPos.Size = UDim2.new(0.35, 0, 1, 0)
+		cancelPos.Position = UDim2.new(0.65, 0, 0, 0)
+		cancelPos.MouseButton1Click:Connect(cancelMobilePositions)
+
+		make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
+			Text = "Saved positions are re-applied the next time you enable dragging.",
+			TextColor3 = T.Dim, TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left }, p)
 	end
 
 	------------------------------------------------
@@ -3968,15 +4158,20 @@ createMasterUI = function()
 	local function miniSize()
 		return math.clamp(math.floor(56 * (minimizeScale / 100)), 28, 140)
 	end
+
+	local miniGui, miniSquare
+	local miniDrag, miniDragInput, miniDragStart, miniStartPos, miniPressAt
+	local normalSize, normalPos
+	local buildMiniGui
+
 	uiRefs.applyMiniSize = function()
 		if not uiRefs.minimized then return end
-		local s = miniSize()
-		local cx = main.Position.X.Offset + main.Size.X.Offset / 2
-		local cy = main.Position.Y.Offset + main.Size.Y.Offset / 2
-		local np = UDim2.new(0.5, cx - s / 2, 0.5, cy - s / 2)
-		main.Size = UDim2.fromOffset(s, s)
-		glow.Size = UDim2.fromOffset(s, s)
-		main.Position = np; glow.Position = np
+		if miniSquare and miniSquare.Parent then
+			local absP = miniSquare.AbsolutePosition
+			local s = miniSize()
+			miniSquare.Size = UDim2.fromOffset(s, s)
+			miniSquare.Position = UDim2.fromOffset(absP.X, absP.Y)
+		end
 	end
 
 	local grip = make("TextButton", { Size = UDim2.new(0, 20, 0, 20), Position = UDim2.new(1, -20, 1, -20),
@@ -4004,21 +4199,23 @@ createMasterUI = function()
 		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then resizing = false end
 	end)
 
-	local dragging, dragStart, startPos
+	local dragging, dragStart, startPos, dragInput
 	local function beginDrag(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
 			dragging = true
-			dragInput = i          -- FIX: seed with the press input so the first frame has zero delta
+			dragInput = i
 			dragStart = i.Position
 			startPos = main.Position
 			i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end)
 		end
 	end
-	local dragInput
 	titleBar.InputBegan:Connect(beginDrag)
-	miniLogo.InputBegan:Connect(beginDrag)
+
 	UserInputService.InputChanged:Connect(function(i)
-		if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then dragInput = i end
+		if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
+			dragInput = i
+			miniDragInput = i
+		end
 	end)
 	RunService.RenderStepped:Connect(function()
 		if dragging and dragInput and dragStart and startPos then
@@ -4026,56 +4223,134 @@ createMasterUI = function()
 			local np = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
 			main.Position = np; glow.Position = np
 		end
+		if miniDrag and miniDragInput and miniDragStart and miniStartPos and miniSquare and miniSquare.Parent then
+			local d = miniDragInput.Position - miniDragStart
+			miniSquare.Position = UDim2.new(miniStartPos.X.Scale, miniStartPos.X.Offset + d.X,
+				miniStartPos.Y.Scale, miniStartPos.Y.Offset + d.Y)
+		end
 	end)
 
 	local function toggleMinimize(force)
 		local want = force ~= nil and force or not uiRefs.minimized
 		if want == uiRefs.minimized then return end
 		uiRefs.minimized = want
-		local ti = TweenInfo.new(0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+
 		if want then
-			-- keep the visual centre so the square sits where the menu was
+			normalSize = main.Size
+			normalPos = main.Position
+			tooltip.Visible = false
+
+			local absP, absS = main.AbsolutePosition, main.AbsoluteSize
+			local cx, cy = absP.X + absS.X / 2, absP.Y + absS.Y / 2
 			local s = miniSize()
-			local cx = main.Position.X.Offset + currentNormal.X.Offset / 2
-			local cy = main.Position.Y.Offset + currentNormal.Y.Offset / 2
-			local np = UDim2.new(0.5, cx - s / 2, 0.5, cy - s / 2)
+
+			buildMiniGui(cx, cy)
+
 			body.Visible = false
 			titleBar.Visible = false
 			grip.Visible = false
 			for _, d in ipairs(resizeDecor) do d.Visible = false end
-			miniLogo.Visible = true
-			TweenService:Create(main, ti, { Size = UDim2.fromOffset(s, s), Position = np }):Play()
-			TweenService:Create(glow, ti, { Size = UDim2.fromOffset(s, s), Position = np }):Play()
+
+			local ti = TweenInfo.new(0.26, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+			local targetSize = UDim2.fromOffset(s, s)
+			local targetPos = UDim2.fromOffset(cx - s / 2, cy - s / 2)
+			local tw = TweenService:Create(main, ti, { Size = targetSize, Position = targetPos })
+			TweenService:Create(glow, ti, { Size = targetSize, Position = targetPos }):Play()
+			tw:Play()
+			tw.Completed:Connect(function()
+				-- park the real window exactly where it was, then hide it
+				main.Visible = false
+				glow.Visible = false
+				main.Size = normalSize
+				main.Position = normalPos
+				glow.Size = normalSize
+				glow.Position = normalPos
+			end)
 		else
-			-- expand centred on wherever the square currently is
-			local s = miniSize()
-			local cx = main.Position.X.Offset + s / 2
-			local cy = main.Position.Y.Offset + s / 2
-			local np = UDim2.new(0.5, cx - currentNormal.X.Offset / 2, 0.5, cy - currentNormal.Y.Offset / 2)
+			if not (miniSquare and miniSquare.Parent) then
+				main.Visible = true
+				glow.Visible = true
+				body.Visible = true
+				titleBar.Visible = true
+				grip.Visible = true
+				for _, d in ipairs(resizeDecor) do d.Visible = true end
+				main.Size = normalSize or currentNormal
+				main.Position = normalPos or UDim2.new(0.5, -350, 0.5, -235)
+				glow.Size = main.Size
+				glow.Position = main.Position
+				if miniGui then miniGui:Destroy(); miniGui = nil end
+				return
+			end
+
+			local absP, absS = miniSquare.AbsolutePosition, miniSquare.AbsoluteSize
+			local cx, cy = absP.X + absS.X / 2, absP.Y + absS.Y / 2
+			local s = absS.X
+
+			main.Visible = true
+			glow.Visible = true
 			body.Visible = true
 			titleBar.Visible = true
 			grip.Visible = true
 			for _, d in ipairs(resizeDecor) do d.Visible = true end
-			miniLogo.Visible = false
-			TweenService:Create(main, ti, { Size = currentNormal, Position = np }):Play()
-			TweenService:Create(glow, ti, { Size = currentNormal, Position = np }):Play()
+
+			local fromSize = UDim2.fromOffset(s, s)
+			local fromPos = UDim2.fromOffset(cx - s / 2, cy - s / 2)
+			main.Size = fromSize
+			main.Position = fromPos
+			glow.Size = fromSize
+			glow.Position = fromPos
+
+			local ti = TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+			TweenService:Create(main, ti, { Size = normalSize, Position = normalPos }):Play()
+			TweenService:Create(glow, ti, { Size = normalSize, Position = normalPos }):Play()
+
+			if miniGui then miniGui:Destroy(); miniGui = nil end
+			miniSquare = nil
+			miniDrag = false
 		end
 	end
-	minBtn.MouseButton1Click:Connect(function() playClick(); toggleMinimize() end)
 
-	local miniPressAt = nil
-	miniLogo.InputBegan:Connect(function(i)
-		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-			miniPressAt = i.Position
+	buildMiniGui = function(cx, cy)
+		if miniGui then miniGui:Destroy() end
+		miniGui = make("ScreenGui", { Name = "LunarMini", ResetOnSpawn = false,
+			IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 60 }, UI_PARENT)
+
+		local s = miniSize()
+		miniSquare = make("Frame", { Size = UDim2.fromOffset(s, s),
+			Position = UDim2.fromOffset(cx - s / 2, cy - s / 2),
+			BackgroundColor3 = T.Bg2, BorderSizePixel = 0, Active = true, ZIndex = 1 }, miniGui)
+		corner(miniSquare, 12)
+		stroke(miniSquare, T.Accent, 0.2, 1.6)
+		themeGradient(miniSquare, "Bg1", "Bg2", 135)
+		make("ImageLabel", { Size = UDim2.new(1, -12, 1, -12), AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.new(0.5, 0, 0.5, 0), BackgroundTransparency = 1, Image = LOGO_ID }, miniSquare)
+		for _, pos in ipairs({ UDim2.new(0, 5, 1, -19), UDim2.new(1, -19, 1, -19) }) do
+			local b = make("Frame", { Size = UDim2.new(0, 14, 0, 14), Position = pos, BackgroundTransparency = 1 }, miniSquare)
+			stroke(b, T.Accent, 0.35, 2)
 		end
-	end)
-	miniLogo.InputEnded:Connect(function(i)
-		if miniPressAt and (i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch) then
-			local moved = (i.Position - miniPressAt).Magnitude
-			miniPressAt = nil
-			if moved < 6 then playClick(); toggleMinimize(false) end
-		end
-	end)
+
+		miniSquare.InputBegan:Connect(function(i)
+			if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+				miniDrag = true
+				miniDragInput = i
+				miniDragStart = i.Position
+				miniStartPos = miniSquare.Position
+				miniPressAt = i.Position
+				i.Changed:Connect(function()
+					if i.UserInputState == Enum.UserInputState.End then miniDrag = false end
+				end)
+			end
+		end)
+		miniSquare.InputEnded:Connect(function(i)
+			if miniPressAt and (i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch) then
+				local moved = (i.Position - miniPressAt).Magnitude
+				miniPressAt = nil
+				if moved < 6 then playClick(); toggleMinimize(false) end
+			end
+		end)
+	end
+
+	minBtn.MouseButton1Click:Connect(function() playClick(); toggleMinimize() end)
 
 	keybinds["Minimize Menu"] = keybinds["Minimize Menu"] or Enum.KeyCode.M
 	keyTriggers["Minimize Menu"] = function() toggleMinimize() end
@@ -4083,6 +4358,7 @@ createMasterUI = function()
 
 	local function toggleVisible()
 		gui.Enabled = not gui.Enabled
+		if miniGui then miniGui.Enabled = gui.Enabled end
 	end
 	keybinds["Toggle UI"] = keybinds["Toggle UI"] or Enum.KeyCode.Escape
 	keyTriggers["Toggle UI"] = toggleVisible
@@ -4107,6 +4383,7 @@ createMasterUI = function()
 		if hum then hum.WalkSpeed = 12 end
 		pcall(function() saveConfig(true) end)
 		showNotification("Menu closed — everything disabled", 1.8)
+		if miniGui then miniGui:Destroy(); miniGui = nil end
 		gui:Destroy()
 		if type(CLOSE_SCRIPT) == "string" and CLOSE_SCRIPT ~= "" then
 			task.spawn(function()
