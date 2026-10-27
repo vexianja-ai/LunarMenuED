@@ -1,29 +1,20 @@
 --[[
-	LUNAR MENU — v2.1.6
-	+ GOD WEAPON Simulation (Miscellaneous):
-	    - blocks all non-executor AttemptToolUse fires while a GOD WEAPON is detected
-	    - fires our own AttemptToolUse on M1 (PC) / HUD Use button (mobile)
-	    - hitbox range gate, optional hitbox visual, optional detection notification
-	    - item replacement box (falls back to the current throwable name)
-	    - warns on missing critical functions
-	+ keybind button is now a square keycap instead of a rectangle
+	LUNAR MENU — v2.2.0
+	+ Walk Speed is now a text box and is applied via a __newindex hook (0 is preserved for drink locks)
+	+ No Jump Cooldown: SetStateEnabled(Jumping) is forced true via hook
+	+ Structure ESP (General) with Ignore self-structures + saved fill/outline/text colours
+	+ Builder: Auto Complete Structures switch + "Auto Complete Near Structures" button
+	+ Item Stats editor (Miscellaneous): pick any item, edit every key of its table live
+	+ Wellness + Trap target dropdowns are multi-select with All / Others / Nearest
+	+ God sim now flags every missing critical function, not just checkcaller
+	+ FIX: minimised square keeps the menu's centre; expanding returns it to the same spot
+	+ FIX: stale drag input made the window jump on the first frame of a drag
+	+ GOD WEAPON Simulation (Miscellaneous)
+	+ keybind keycap is a square
 	+ click the minimised square to expand it (dragging still repositions)
-	+ resize corner brackets are hidden while minimised
-	+ Settings "Extra Keybinds" are now plain rows, not a dropdown/panel
-	+ FIX: keybind button was a TextButton (no Image property) -> ImageButton + child label
-	+ keybinds are now manual: [+] next to each row -> press a key -> keycap image + key text
-	+ config on disk is ONLY keybinds + theme (lean save)
-	+ every colour in the palette is now editable (14 pickers)
-	+ UI parented to gethui() when available
-	+ Settings: keybinds master switch, modify keybind, remove keybinds (multi), clear all,
-	            minimize-square size slider, keybind for minimize/expand
-	+ Esc hides the whole UI (rebindable)
-	+ version text + your avatar/username in the title bar
-	+ General: Rejoin + Server Hop
-	+ Miscellaneous: Game Teleporter by PlaceId or name (shows icon + name)
-	+ minimise is now a square with an outline and the logo centred (scalable 50-200%)
-	+ FIX: construct mode locking the mouse on PC (viewport cameras are Scriptable now)
-	+ feature ranges all live in their own "[name] Settings" dropdowns
+	+ resize corner brackets hidden while minimised
+	+ Settings "Extra Keybinds" are plain rows, not a dropdown/panel
+	+ config on disk is keybinds + theme + ESP colours
 ]]--
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -100,6 +91,7 @@ local ThrownSpearReplication = RemoteOther and RemoteOther:FindFirstChild("Throw
 local BuildPlaceRemote = RemoteMain and (RemoteMain:FindFirstChild("BuildPlace") or RemoteMain:WaitForChild("BuildPlace", 5))
 local ChangeValueRemote = RemoteMain and (RemoteMain:FindFirstChild("ChangeValue") or RemoteMain:WaitForChild("ChangeValue", 5))
 local AttemptToolUse = RemoteOther and (RemoteOther:FindFirstChild("AttemptToolUse") or RemoteOther:WaitForChild("AttemptToolUse", 5))
+local BuildBlueprintAdd = RemoteMain and (RemoteMain:FindFirstChild("BuildBlueprintAdd") or RemoteMain:WaitForChild("BuildBlueprintAdd", 5))
 
 local function httpGet(url)
 	if type(game.HttpGet) == "function" then
@@ -141,12 +133,26 @@ local animalEspHealth = false
 local ANIMAL_ESP_DISTANCE = 650
 local animalIgnore = {}
 
+local structEspActive = false
+local structEspIgnoreSelf = true
+local structEspMarked = {}
+
 local espTeamColors = false
 local espShowHealth = false
 local espFriendsOnly = false
 
-local walkSpeedValue = 16
+local espColors = {
+	StructureFill = Color3.fromRGB(90, 200, 255),
+	StructureOutline = Color3.fromRGB(255, 255, 255),
+	StructureText = Color3.fromRGB(200, 235, 255),
+}
+
+local walkSpeedValue = 60
 local walkBoostActive = false
+local noJumpCooldown = true
+
+local autoCompleteStructures = false
+local autoCompleteBurst = false
 
 local changeValueMode = "add"
 local minimizeScale = 100
@@ -238,12 +244,11 @@ end
 ----------------------------------------------------
 local LOGO_ID = "rbxassetid://8498174594"
 local KEYBIND_IMG = "rbxassetid://126810011338788"
-local VERSION = "v2.1.6"
+local VERSION = "v2.2.0"
 
 local function make(class, props, parent)
 	local i = Instance.new(class)
 	for k, v in pairs(props or {}) do
-		-- only assign if the property actually exists (TextButton has no Image, etc.)
 		local ok = pcall(function() i[k] = v end)
 		if not ok then pcall(function() i[k] = v end) end
 	end
@@ -310,7 +315,7 @@ end
 ----------------------------------------------------
 local keybinds = {}
 local keyTriggers = {}
-local keyRefs = {}       -- [action] = { btn = ImageButton, txt = TextLabel }
+local keyRefs = {}
 local listeningAction = nil
 local panelSyncers = {}
 
@@ -318,7 +323,6 @@ local function syncPanels()
 	for _, f in ipairs(panelSyncers) do pcall(f) end
 end
 
--- btn is an ImageButton (TextButton has no Image property)
 local function refreshKeyVisual(action)
 	local ref = keyRefs[action]
 	if not ref or not ref.btn or not ref.btn.Parent then return end
@@ -624,6 +628,27 @@ local function createBillboard(character, tag)
 	return billboard
 end
 
+local function structBillboard(model)
+	local b = Instance.new("BillboardGui")
+	b.Name = "LunarStructESP_B"
+	b.Adornee = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+	b.Size = UDim2.new(0, 210, 0, 26)
+	b.StudsOffset = Vector3.new(0, 3, 0)
+	b.AlwaysOnTop = true
+	b.Parent = model
+	local l = Instance.new("TextLabel")
+	l.Name = "Label"
+	l.Size = UDim2.new(1, 0, 1, 0)
+	l.BackgroundTransparency = 1
+	l.Text = ""
+	l.TextColor3 = espColors.StructureText
+	l.TextStrokeTransparency = 0
+	l.Font = Enum.Font.GothamBold
+	l.TextSize = 12
+	l.Parent = b
+	return b
+end
+
 local function espText(plr, char)
 	local parts = {}
 	if espTeamColors and plr.Team then table.insert(parts, "[" .. plr.Team.Name .. "]") end
@@ -639,6 +664,11 @@ end
 local function removeESP(character, tag)
 	if character:FindFirstChild(tag .. "_Highlight") then character[tag .. "_Highlight"]:Destroy() end
 	if character:FindFirstChild(tag .. "_Billboard") then character[tag .. "_Billboard"]:Destroy() end
+end
+
+local function structEspRemove(model)
+	local h = model:FindFirstChild("LunarStructESP_H"); if h then h:Destroy() end
+	local b = model:FindFirstChild("LunarStructESP_B"); if b then b:Destroy() end
 end
 
 local function getAnimalFolder() return Workspace:FindFirstChild("Animals") end
@@ -745,11 +775,60 @@ RunService.Heartbeat:Connect(function()
 	end
 end)
 
+-- Structure ESP loop (runs independently of the menu lifetime)
+task.spawn(function()
+	while task.wait(0.4) do
+		if structEspActive then
+			local root = Workspace:FindFirstChild("Interactables")
+			local folder = root and root:FindFirstChild("Structures")
+			if folder then
+				local current = {}
+				for _, m in ipairs(folder:GetDescendants()) do
+					if m:IsA("Model") and m.PrimaryPart and m.Parent and m.Parent.Parent == folder then
+						local owner = m.Parent.Name
+						local selfOwned = (owner == LocalPlayer.Name)
+						if not (structEspIgnoreSelf and selfOwned) then
+							current[m] = true
+							local h = m:FindFirstChild("LunarStructESP_H")
+							if not h then
+								h = Instance.new("Highlight", m)
+								h.Name = "LunarStructESP_H"
+								h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+								h.FillTransparency = 0.6
+							end
+							h.FillColor = espColors.StructureFill
+							h.OutlineColor = espColors.StructureOutline
+							local b = m:FindFirstChild("LunarStructESP_B")
+							if not b then b = structBillboard(m) end
+							local lbl = b and b:FindFirstChild("Label")
+							if lbl then
+								lbl.Text = m.Name .. (selfOwned and "  (you)" or ("  @" .. owner))
+								lbl.TextColor3 = espColors.StructureText
+							end
+						end
+					end
+				end
+				for m in pairs(structEspMarked) do
+					if not current[m] then structEspRemove(m) end
+				end
+				structEspMarked = current
+			end
+		elseif next(structEspMarked) then
+			for m in pairs(structEspMarked) do
+				if m and m.Parent then structEspRemove(m) end
+			end
+			structEspMarked = {}
+		end
+	end
+end)
+
 ----------------------------------------------------
--- SPEAR ENGINE
+-- SPEAR ENGINE + HOOKS
 ----------------------------------------------------
 local hookmetamethod, getnamecallmethod, newcclosure, checkcaller, getconnections, hookfunction =
 	hookmetamethod, getnamecallmethod, newcclosure, checkcaller, getconnections, hookfunction
+
+local wrapClosure = newcclosure or function(f) return f end
 
 local HOOK_DEPS = { "hookmetamethod", "getnamecallmethod", "newcclosure", "checkcaller", "getconnections" }
 local hookWarned = false
@@ -763,6 +842,41 @@ local function ensureHookSupport()
 		hookWarned = true
 		showNotification("Unsupported: " .. table.concat(miss, ", "), 4)
 	end
+end
+
+-- No jump cooldown: force the Jumping state to stay enabled
+local function refreshSpeedHumanoid() end
+
+if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
+	local oldNC
+	oldNC = hookmetamethod(game, "__namecall", wrapClosure(function(self, ...)
+		if noJumpCooldown and getnamecallmethod() == "SetStateEnabled"
+			and typeof(self) == "Instance" and self:IsA("Humanoid") then
+			local state = ...
+			if state == Enum.HumanoidStateType.Jumping then
+				return oldNC(self, state, true)
+			end
+		end
+		return oldNC(self, ...)
+	end))
+end
+
+-- WalkSpeed override at the property write, preserving 0 (drink lock)
+local speedHumanoid = nil
+local function refreshSpeedTarget()
+	speedHumanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid") or nil
+end
+refreshSpeedTarget()
+
+if type(hookmetamethod) == "function" then
+	local oldNI
+	oldNI = hookmetamethod(game, "__newindex", wrapClosure(function(self, k, v)
+		if walkBoostActive and k == "WalkSpeed" and rawequal(self, speedHumanoid)
+			and type(v) == "number" and v > 0 then
+			return oldNI(self, k, walkSpeedValue)
+		end
+		return oldNI(self, k, v)
+	end))
 end
 
 local spearMode = { visualOnly = false, noVisual = false }
@@ -807,6 +921,22 @@ if hookmetamethod and getnamecallmethod and newcclosure then
 	end))
 end
 
+-- Auto complete blueprints: rewrite "not" -> "can"
+if BuildBlueprintAdd and type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
+	local oldNC
+	oldNC = hookmetamethod(game, "__namecall", wrapClosure(function(self, ...)
+		if (autoCompleteStructures or autoCompleteBurst)
+			and rawequal(self, BuildBlueprintAdd) and getnamecallmethod() == "FireServer" then
+			local args = table.pack(...)
+			if args[1] == "not" then
+				args[1] = "can"
+				return oldNC(table.unpack(args, 1, args.n))
+			end
+		end
+		return oldNC(self, ...)
+	end))
+end
+
 local function killConnections(signal)
 	if not getconnections then return false end
 	local ok, conns = pcall(getconnections, signal)
@@ -828,6 +958,38 @@ if ThrownSpearReplication and killConnections(ThrownSpearReplication.OnClientEve
 end
 
 ----------------------------------------------------
+-- TARGET RESOLUTION (shared by wellness / trap)
+----------------------------------------------------
+local function resolveTargets(list)
+	local out, seen = {}, {}
+	local function add(pl)
+		if pl and pl.Parent and not seen[pl] then seen[pl] = true; table.insert(out, pl) end
+	end
+	for _, v in ipairs(list or {}) do
+		if v == "All" then
+			for _, pl in ipairs(Players:GetPlayers()) do add(pl) end
+		elseif v == "Others" then
+			for _, pl in ipairs(Players:GetPlayers()) do if pl ~= LocalPlayer then add(pl) end end
+		elseif v == "Nearest" then
+			local best, bd
+			local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+			if root then
+				for _, pl in ipairs(Players:GetPlayers()) do
+					if pl ~= LocalPlayer and pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
+						local d = (pl.Character.HumanoidRootPart.Position - root.Position).Magnitude
+						if not bd or d < bd then best, bd = pl, d end
+					end
+				end
+			end
+			add(best)
+		elseif typeof(v) == "Instance" then
+			add(v)
+		end
+	end
+	return out
+end
+
+----------------------------------------------------
 -- RUNTIME CONFIG TABLES
 ----------------------------------------------------
 local throwEnabled   = false
@@ -841,10 +1003,11 @@ local protectExtras = { Radius = 35, Interval = 2, CustomItem = "", Count = 1, D
 local concurrent    = { Active = false, Spacing = 6, MaxRange = 400, Holding = false, Auto = false,
 	StartPos = nil, CurrPos = nil, PerStuds = 8, GroundSnap = true, MultiLine = false, Path = {} }
 local lineCfg       = { Range = 400, PerStuds = 8, GroundSnap = true, CustomStructure = "" }
-local trapCfg       = { Target = "all", CustomStructure = "", Amount = 4 }
+local trapCfg       = { Targets = { "All" }, CustomStructure = "", Amount = 4 }
 local tpSafe        = true
 local tpTarget      = nil
-local wellnessTarget, wellnessClickMode = nil, false
+local wellnessTargets = {}
+local wellnessClickMode = false
 
 local spreadCfg     = { Range = 60, CustomItem = "", TargetPlayers = false, Duration = 5 }
 local spreadAttack  = { Active = false, Walk = nil, Jump = nil, JumpH = nil }
@@ -865,7 +1028,7 @@ local function getThumb(plr)
 end
 
 ----------------------------------------------------
--- CONFIG  (keybinds + theme ONLY)
+-- CONFIG  (keybinds + theme + esp colours)
 ----------------------------------------------------
 local SAVE_FOLDER = "LunarMenu"
 local SAVE_FILE = SAVE_FOLDER .. "/config.json"
@@ -900,7 +1063,9 @@ local function buildConfigTable()
 	for act, key in pairs(keybinds) do kb[act] = key.Name end
 	local th = {}
 	for k, c in pairs(T) do th[k] = { c.R, c.G, c.B } end
-	return { keybinds = kb, theme = th }
+	local esp = {}
+	for k, c in pairs(espColors) do esp[k] = { c.R, c.G, c.B } end
+	return { keybinds = kb, theme = th, esp = esp }
 end
 
 local function writeConfigToDisk()
@@ -952,6 +1117,13 @@ local function loadConfig()
 			end
 		end
 	end
+	if type(data.esp) == "table" then
+		for k, rgb in pairs(data.esp) do
+			if espColors[k] and type(rgb) == "table" and #rgb >= 3 then
+				espColors[k] = Color3.new(rgb[1], rgb[2], rgb[3])
+			end
+		end
+	end
 end
 
 pcall(loadConfig)
@@ -971,8 +1143,59 @@ local function applyStartupFlags()
 		LocalPlayer.CameraMaxZoomDistance = 1000000
 		LocalPlayer.CameraMinZoomDistance = 0.5
 	end
-	local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-	if hum then hum.WalkSpeed = walkBoostActive and walkSpeedValue or 16 end
+	refreshSpeedTarget()
+	local hum = speedHumanoid
+	if hum then hum.WalkSpeed = walkBoostActive and walkSpeedValue or 12 end
+end
+
+----------------------------------------------------
+-- AUTO COMPLETE NEAR STRUCTURES
+----------------------------------------------------
+local function autoCompleteNear()
+	local ch = LocalPlayer.Character
+	local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+	if not hrp then showNotification("No character!", 1.4); return end
+	local root = Workspace:FindFirstChild("Interactables")
+	local folder = root and root:FindFirstChild("Structures")
+	if not folder then showNotification("No structures found", 1.5); return end
+
+	local list = {}
+	for _, m in ipairs(folder:GetDescendants()) do
+		if m:IsA("Model") and m.PrimaryPart and m:GetAttribute("CurrentStageIndex") ~= nil then
+			local holder = m:FindFirstChild("prompt")
+			local prompt = holder and holder:FindFirstChild("ProximityPrompt")
+			if prompt then
+				local reach = (prompt.MaxActivationDistance or 10) + 4
+				if (m.PrimaryPart.Position - hrp.Position).Magnitude <= reach then
+					table.insert(list, m)
+				end
+			end
+		end
+	end
+	if #list == 0 then showNotification("No incomplete structures nearby", 1.8); return end
+
+	showNotification("Auto completing " .. #list .. " structure(s)...", 2)
+	autoCompleteBurst = true
+	task.spawn(function()
+		local done = 0
+		for _, m in ipairs(list) do
+			local holder = m:FindFirstChild("prompt")
+			local prompt = holder and holder:FindFirstChild("ProximityPrompt")
+			if prompt and m.Parent then
+				for _ = 1, 40 do
+					if not m.Parent or m:GetAttribute("CurrentStageIndex") == nil then break end
+					prompt:InputHoldBegin()
+					task.wait(math.max(prompt.HoldDuration, 0.05))
+					prompt:InputHoldEnd()
+					task.wait(0.2)
+				end
+				done += 1
+			end
+		end
+		task.wait(0.3)
+		autoCompleteBurst = false
+		showNotification("Auto complete finished (" .. done .. ")", 1.6)
+	end)
 end
 
 ----------------------------------------------------
@@ -986,7 +1209,7 @@ local function spreadFreeze(on)
 		spreadAttack.Walk = hum.WalkSpeed; spreadAttack.Jump = hum.JumpPower; spreadAttack.JumpH = hum.JumpHeight
 		hum.WalkSpeed = 0; hum.JumpPower = 0; hum.JumpHeight = 0
 	else
-		hum.WalkSpeed = spreadAttack.Walk or (walkBoostActive and walkSpeedValue or 16)
+		hum.WalkSpeed = spreadAttack.Walk or 12
 		hum.JumpPower = spreadAttack.Jump or 50
 		hum.JumpHeight = spreadAttack.JumpH or 7.2
 	end
@@ -1145,12 +1368,10 @@ local function godItemName()
 	return currentThrowableName
 end
 
--- true while simulating and a GOD WEAPON is present
 local function godActive()
 	return god.Enabled and god.Detected
 end
 
--- true when the call originates from our own executor context
 local function godIsOurCall()
 	if type(checkcaller) == "function" then
 		local ok, res = pcall(checkcaller)
@@ -1159,7 +1380,6 @@ local function godIsOurCall()
 	return false
 end
 
--- decide for a single incoming AttemptToolUse call: block foreign, let ours through untouched
 local function godShouldBlock()
 	return godActive() and not godIsOurCall()
 end
@@ -1180,7 +1400,6 @@ local function godTargetInRange()
 	return false
 end
 
--- our own fire, with our own argument, only when something is in the hitbox
 local function godFire()
 	if not godActive() then return end
 	if UserInputService:GetFocusedTextBox() then return end
@@ -1202,6 +1421,7 @@ local function checkGodFunctions()
 	if type(getnamecallmethod) ~= "function" then table.insert(missing, "getnamecallmethod") end
 	if type(hookfunction) ~= "function" then table.insert(missing, "hookfunction") end
 	if type(checkcaller) ~= "function" then table.insert(missing, "checkcaller") end
+	if type(newcclosure) ~= "function" then table.insert(missing, "newcclosure") end
 	if #missing > 0 then
 		showNotification("Critical Functions missing: " .. table.concat(missing, ", ") .. ". Option may not work.", 5)
 	end
@@ -1212,19 +1432,16 @@ local function installGodHooks()
 	if god.HooksInstalled or not AttemptToolUse then return end
 	god.HooksInstalled = true
 
-	-- Event:FireServer(...)
-	if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" and type(newcclosure) == "function" then
+	if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
 		local oldNamecall
-		oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(...)
-			local self = ...
+		oldNamecall = hookmetamethod(game, "__namecall", wrapClosure(function(self, ...)
 			if rawequal(self, AttemptToolUse) and getnamecallmethod() == "FireServer" then
 				if godShouldBlock() then return end
 			end
-			return oldNamecall(...)
+			return oldNamecall(self, ...)
 		end))
 	end
 
-	-- Event.FireServer(Event, ...)
 	if type(hookfunction) == "function" then
 		local oldFire
 		oldFire = hookfunction(AttemptToolUse.FireServer, function(self, ...)
@@ -1265,13 +1482,10 @@ local function hookGodMobile()
 	if god.MobileBtn == btn and god.MobileConn then return true end
 	if god.MobileConn then pcall(function() god.MobileConn:Disconnect() end) end
 	god.MobileBtn = btn
-	god.MobileConn = btn.Activated:Connect(function()
-		godFire()
-	end)
+	god.MobileConn = btn.Activated:Connect(function() godFire() end)
 	return true
 end
 
--- our own trigger on PC
 UserInputService.InputBegan:Connect(function(i, gp)
 	if gp or IS_MOBILE then return end
 	if i.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
@@ -1280,7 +1494,6 @@ UserInputService.InputBegan:Connect(function(i, gp)
 	godFire()
 end)
 
--- hitbox visual
 RunService.Heartbeat:Connect(function()
 	if god.Enabled and god.ShowHitbox then
 		local p = godHitboxPart()
@@ -1297,7 +1510,6 @@ RunService.Heartbeat:Connect(function()
 	end
 end)
 
--- detection watcher
 task.spawn(function()
 	while task.wait(0.4) do
 		if god.Enabled then
@@ -1336,8 +1548,9 @@ UserInputService.InputBegan:Connect(function(input, gp)
 		local ch = hit and hit:FindFirstAncestorOfClass("Model")
 		local pl = ch and Players:GetPlayerFromCharacter(ch)
 		if pl then
-			wellnessTarget = pl; wellnessClickMode = false
-			showNotification("Wellness target: " .. pl.Name, 1.5)
+			if not table.find(wellnessTargets, pl) then table.insert(wellnessTargets, pl) end
+			wellnessClickMode = false
+			showNotification("Wellness target added: " .. pl.Name, 1.5)
 		end
 		return
 	end
@@ -1709,7 +1922,6 @@ createMasterUI = function()
 		box.FocusLost:Connect(function() TweenService:Create(s, TweenInfo.new(.2), { Color = T.Stroke, Transparency = 0.5 }):Play() end)
 	end
 
-	-- [Label .......... [+]  (o) ]
 	local function createToggleKeybind(parent, label, initial, onChange, defaultKey, tip, register)
 		local row = make("TextButton", { Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = T.Panel, Text = "",
 			AutoButtonColor = false, ClipsDescendants = true }, parent)
@@ -1728,8 +1940,6 @@ createMasterUI = function()
 
 		local keyBtn, keyTxt
 		if not IS_MOBILE then
-			-- ImageButton: TextButton has NO Image property. Child label carries the key name.
-			-- Square keycap, aspect preserved by ScaleType.Fit.
 			keyBtn = make("ImageButton", { Size = UDim2.new(0, 22, 0, 22), Position = UDim2.new(1, -110, 0.5, -11),
 				BackgroundColor3 = T.Field, Image = "", ImageTransparency = 1, ScaleType = Enum.ScaleType.Fit,
 				AutoButtonColor = false, ZIndex = 3, ClipsDescendants = false }, row)
@@ -1804,7 +2014,6 @@ createMasterUI = function()
 		return createToggleKeybind(parent, label, initial, onChange, Enum.KeyCode.Unknown, tip, register)
 	end
 
-	-- Plain keybind row (no on/off switch) — used for the extra menu keybinds
 	local function createKeybindRow(parent, label, defaultKey, tip, onPress)
 		local row = make("TextButton", { Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = T.Panel, Text = "",
 			AutoButtonColor = false, ClipsDescendants = true }, parent)
@@ -1951,7 +2160,7 @@ createMasterUI = function()
 	end
 
 	------------------------------------------------
-	-- DROPDOWN
+	-- DROPDOWN (supports multi-select)
 	------------------------------------------------
 	local function createDropdown(parent, title, entries, onSelect, opts)
 		opts = opts or {}
@@ -1981,9 +2190,27 @@ createMasterUI = function()
 		make("UIListLayout", { Padding = UDim.new(0, 4) }, list)
 
 		local current, isOpen = nil, false
+		local selected = {}
+		local rowLabels, rowBase = {}, {}
+
+		local function updateCount()
+			local n = 0
+			for _ in pairs(selected) do n += 1 end
+			valueLbl.Text = n > 0 and (n .. " selected") or "none"
+		end
+
 		local api = {}
 		function api.setValue(v, text) current = v; valueLbl.Text = text or tostring(v) end
 		function api.get() return current end
+		function api.getSelected() return selected end
+		function api.clearSelected()
+			selected = {}
+			for v, lbl in pairs(rowLabels) do
+				lbl.Text = "•  " .. (rowBase[v] or "")
+				lbl.TextColor3 = T.Text
+			end
+			valueLbl.Text = "none"
+		end
 		function api.isOpen() return isOpen end
 		function api.close()
 			isOpen = false; arrow.Text = "v"
@@ -1994,6 +2221,7 @@ createMasterUI = function()
 		function api.setEntries(newEntries)
 			list:ClearAllChildren()
 			make("UIListLayout", { Padding = UDim.new(0, 4) }, list)
+			rowLabels, rowBase = {}, {}
 			listH = math.min(#newEntries * 30 + 12, 180)
 			for idx, e in ipairs(newEntries) do
 				local row = make("TextButton", { Size = UDim2.new(1, 0, 0, 28), Position = UDim2.new(-0.3, 0, 0, 0),
@@ -2005,20 +2233,34 @@ createMasterUI = function()
 						BackgroundTransparency = 1, Image = e.image }, row)
 					corner(img, 6); xOff = 38
 				end
-				make("TextLabel", { Size = UDim2.new(1, -xOff - 10, 1, 0), Position = UDim2.new(0, xOff, 0, 0),
-					BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, Text = e.text,
-					TextColor3 = e.color or T.Text, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+				local mark = opts.multi and (selected[e.value] and "✓  " or "•  ") or ""
+				local lbl = make("TextLabel", { Size = UDim2.new(1, -xOff - 10, 1, 0), Position = UDim2.new(0, xOff, 0, 0),
+					BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, Text = mark .. e.text,
+					TextColor3 = (opts.multi and selected[e.value]) and T.Accent or (e.color or T.Text),
+					TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
 					TextTruncate = Enum.TextTruncate.AtEnd }, row)
+				rowLabels[e.value] = lbl
+				rowBase[e.value] = e.text
 				hover(row, T.PanelD, T.Hover)
 				TweenService:Create(row, TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out, 0, false, idx * 0.02),
 					{ Position = UDim2.new(0, 0, 0, 0) }):Play()
 				row.MouseButton1Down:Connect(function() ripple(row) end)
 				row.MouseButton1Click:Connect(function()
-					playClick(); api.setValue(e.value, e.text)
-					if onSelect then onSelect(e) end
-					if not opts.keepOpen then api.close() end
+					playClick()
+					if opts.multi then
+						selected[e.value] = (not selected[e.value]) or nil
+						lbl.Text = (selected[e.value] and "✓  " or "•  ") .. e.text
+						lbl.TextColor3 = selected[e.value] and T.Accent or (e.color or T.Text)
+						updateCount()
+						if onSelect then onSelect(e) end
+					else
+						api.setValue(e.value, e.text)
+						if onSelect then onSelect(e) end
+						if not opts.keepOpen then api.close() end
+					end
 				end)
 			end
+			if opts.multi then updateCount() end
 			if isOpen then
 				contentBox.Size = UDim2.new(1, 0, 0, listH + extraH + 16)
 				list.Size = UDim2.new(1, -16, 0, listH)
@@ -2087,9 +2329,10 @@ createMasterUI = function()
 	end
 
 	------------------------------------------------
-	-- COLOR PICKER
+	-- COLOR PICKER (works on any table)
 	------------------------------------------------
-	local function createColorPicker(parent, label, key)
+	local function createColorPicker(parent, label, key, tbl)
+		tbl = tbl or T
 		local holder = make("Frame", { Size = UDim2.new(1, 0, 0, 100), BackgroundColor3 = T.Panel,
 			BackgroundTransparency = 0.35, BorderSizePixel = 0 }, parent)
 		corner(holder, 9); stroke(holder, T.Stroke, 0.55)
@@ -2101,10 +2344,10 @@ createMasterUI = function()
 			BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "#FFFFFF", TextColor3 = T.Dim,
 			TextSize = 10, TextXAlignment = Enum.TextXAlignment.Right }, holder)
 		local swatch = make("Frame", { Size = UDim2.new(0, 22, 0, 22), Position = UDim2.new(1, -32, 0, 26),
-			BackgroundColor3 = T[key], BorderSizePixel = 0 }, holder)
+			BackgroundColor3 = tbl[key], BorderSizePixel = 0 }, holder)
 		corner(swatch, 6); stroke(swatch, Color3.new(1, 1, 1), 0.4)
 
-		local h, s, v = T[key]:ToHSV()
+		local h, s, v = tbl[key]:ToHSV()
 		local bars = {}
 
 		local function makeBar(y, getV, setV)
@@ -2145,7 +2388,7 @@ createMasterUI = function()
 
 		local function refresh()
 			local col = Color3.fromHSV(h, s, v)
-			T[key] = col
+			tbl[key] = col
 			swatch.BackgroundColor3 = col
 			hex.Text = string.format("#%02X%02X%02X", math.floor(col.R * 255), math.floor(col.G * 255), math.floor(col.B * 255))
 			bars[1].grad.Color = ColorSequence.new(
@@ -2448,24 +2691,47 @@ createMasterUI = function()
 			onToggle = function(open) if open then animalDrop.setEntries(animalEntries()) end end,
 		})
 
+		sectionTitle(p, "Structure ESP")
+		createToggleKeybind(p, "Structure ESP", structEspActive, function(v)
+			structEspActive = v
+			if not v then
+				for m in pairs(structEspMarked) do if m and m.Parent then structEspRemove(m) end end
+				structEspMarked = {}
+			end
+			showNotification(v and "Structure ESP ON" or "Structure ESP OFF", 1.3)
+		end, Enum.KeyCode.Unknown, "Highlight every structure in Workspace.Interactables.Structures")
+
+		local _, structBody = createExpandPanel(p, "Structure ESP Settings", "Self filter and colours")
+		createToggle(structBody, "Ignore self-structures", structEspIgnoreSelf, function(v) structEspIgnoreSelf = v end,
+			"Skip structures you own (folder named after you)", false)
+		createColorPicker(structBody, "Fill Color", "StructureFill", espColors)
+		createColorPicker(structBody, "Outline Color", "StructureOutline", espColors)
+		createColorPicker(structBody, "Text Color", "StructureText", espColors)
+
 		sectionTitle(p, "Movement")
 		createToggleKeybind(p, "Walk Speed Boost", walkBoostActive, function(v)
 			walkBoostActive = v
-			local ch = LocalPlayer.Character
-			local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-			if hum then hum.WalkSpeed = v and walkSpeedValue or 16 end
-			showNotification(v and ("Walk Speed: " .. walkSpeedValue) or "Walk Speed: default", 1.4)
-		end, Enum.KeyCode.G, "Toggle between default (16) and your Walk Speed value")
-
-		local _, moveBody = createExpandPanel(p, "Movement Settings", "Walk speed")
-		createSlider(moveBody, "Walk Speed", 1, 32, walkSpeedValue, 1, function(v)
-			walkSpeedValue = v
-			if walkBoostActive then
-				local ch = LocalPlayer.Character
-				local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-				if hum then hum.WalkSpeed = v end
+			refreshSpeedTarget()
+			local hum = speedHumanoid
+			if hum then
+				if v then hum.WalkSpeed = walkSpeedValue else hum.WalkSpeed = 12 end
 			end
-		end, "Boosted speed used when Walk Speed Boost is on")
+			showNotification(v and ("Walk Speed: " .. walkSpeedValue) or "Walk Speed: default", 1.4)
+		end, Enum.KeyCode.G, "Hooks WalkSpeed so the game cannot overwrite it")
+
+		local _, moveBody = createExpandPanel(p, "Movement Settings", "Walk speed and jump")
+		createTextBox(moveBody, "Walk Speed", "e.g. 60", tostring(walkSpeedValue), function(v)
+			local n = tonumber(v)
+			if n and n > 0 then
+				walkSpeedValue = n
+				refreshSpeedTarget()
+				showNotification("Walk Speed: " .. n, 1.3)
+			end
+		end, "Forced onto the humanoid while Walk Speed Boost is on")
+		createToggle(moveBody, "No Jump Cooldown", noJumpCooldown, function(v)
+			noJumpCooldown = v
+			showNotification(v and "No Jump Cooldown ON" or "No Jump Cooldown OFF", 1.4)
+		end, "Keeps the Jumping state enabled so the stamina/cooldown gate can't block you", false)
 
 		sectionTitle(p, "Teleport")
 		createToggleKeybind(p, "Teleport", false, function(v)
@@ -2542,38 +2808,53 @@ createMasterUI = function()
 		Players.PlayerRemoving:Connect(function() task.wait(0.3); tpDrop.setEntries(tpEntries()) end)
 
 		sectionTitle(p, "Wellness")
-		local _, wBody = createExpandPanel(p, "Wellness Settings", "Target, mode and amounts")
+		local _, wBody = createExpandPanel(p, "Wellness Settings", "Multi-target, mode and amounts")
 
 		local function wEntries()
 			local list = {
+				{ text = "All Players", value = "All" },
+				{ text = "Others", value = "Others" },
+				{ text = "Nearest Player", value = "Nearest" },
 				{ text = "Local Player", value = LocalPlayer },
-				{ text = "Click To Select", value = "click" },
 			}
 			for _, pl in ipairs(Players:GetPlayers()) do
-				if pl ~= LocalPlayer then
-					table.insert(list, { text = pl.DisplayName .. " (@" .. pl.Name .. ")", value = pl, image = getThumb(pl) })
-				end
+				table.insert(list, { text = pl.DisplayName .. " (@" .. pl.Name .. ")", value = pl, image = getThumb(pl) })
 			end
 			return list
 		end
 
 		local wLbl = make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
-			Font = Enum.Font.GothamMedium, Text = "Target: Local Player", TextColor3 = T.Dim, TextSize = 10,
-			TextXAlignment = Enum.TextXAlignment.Left }, wBody)
+			Font = Enum.Font.GothamMedium, Text = "Empty = Local Player. Click several to multi-select.",
+			TextColor3 = T.Dim, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left }, wBody)
 
 		local wDrop
-		wDrop = createDropdown(wBody, "Wellness Target", wEntries(), function(e)
+		wDrop = createDropdown(wBody, "Wellness Target(s)", wEntries(), function(e)
 			if e.value == "click" then
-				wellnessTarget = nil; wellnessClickMode = true
-				wLbl.Text = "Target: click a player"
-			else
-				wellnessTarget = e.value; wellnessClickMode = false
-				wLbl.Text = "Target: " .. (e.value == LocalPlayer and "Local Player" or e.value.Name)
+				wellnessClickMode = true
+				showNotification("Click a player in the world", 1.6)
 			end
-		end, { tip = "Local Player can be reselected anytime" })
+		end, { tip = "Multi-select. Empty selection applies to you.", multi = true, keepOpen = true,
+			onToggle = function(open) if open then wDrop.setEntries(wEntries()) end end })
 
+		-- keep a "Click To Select" entry available too
 		Players.PlayerAdded:Connect(function() task.wait(0.5); wDrop.setEntries(wEntries()) end)
 		Players.PlayerRemoving:Connect(function() task.wait(0.3); wDrop.setEntries(wEntries()) end)
+
+		local wRow = make("Frame", { Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1 }, wBody)
+		local clickSel = createButton(wRow, "Add By Clicking", Color3.fromRGB(60, 90, 150), "Click a player in the world to add them")
+		clickSel.Size = UDim2.new(0.62, 0, 1, 0)
+		clickSel.MouseButton1Click:Connect(function()
+			wellnessClickMode = true
+			showNotification("Click a player in the world", 1.6)
+		end)
+		local clearSel = createButton(wRow, "Clear", Color3.fromRGB(140, 50, 60), "Clear the selection")
+		clearSel.Size = UDim2.new(0.35, 0, 1, 0)
+		clearSel.Position = UDim2.new(0.65, 0, 0, 0)
+		clearSel.MouseButton1Click:Connect(function()
+			wellnessTargets = {}
+			wDrop.clearSelected()
+			showNotification("Wellness targets cleared", 1.3)
+		end)
 
 		local modeBtn = createButton(wBody, "Mode: ADD", Color3.fromRGB(38, 110, 60), "Switch between ADD and REMOVE")
 		local addMode = true
@@ -2597,16 +2878,23 @@ createMasterUI = function()
 		tBtn.MouseButton1Down:Connect(function() ripple(tBtn) end)
 
 		local function applyWellness(folder, box)
-			local tgt = wellnessTarget or LocalPlayer
-			local w = tgt and tgt:FindFirstChild("Wellness")
-			local stat = w and w:FindFirstChild(folder)
+			local selected = wDrop.getSelected()
+			local chosen = {}
+			for v in pairs(selected) do table.insert(chosen, v) end
+			for _, pl in ipairs(wellnessTargets) do table.insert(chosen, pl) end
+			local targets = resolveTargets(chosen)
+			if #targets == 0 then targets = { LocalPlayer } end
 			local amt = tonumber(box.Text) or 10
-			if stat and ChangeValueRemote then
-				ChangeValueRemote:FireServer(stat, amt, changeValueMode)
-				showNotification(folder .. " " .. (changeValueMode == "add" and "+" or "-") .. amt .. " -> " .. tgt.Name, 1.8)
-			else
-				showNotification("Missing Wellness/" .. folder .. " on target", 1.8)
+			local done = 0
+			for _, tgt in ipairs(targets) do
+				local w = tgt:FindFirstChild("Wellness")
+				local stat = w and w:FindFirstChild(folder)
+				if stat and ChangeValueRemote then
+					ChangeValueRemote:FireServer(stat, amt, changeValueMode)
+					done += 1
+				end
 			end
+			showNotification(folder .. " " .. (changeValueMode == "add" and "+" or "-") .. amt .. " -> " .. done .. " player(s)", 1.8)
 		end
 		hBtn.MouseButton1Click:Connect(function() applyWellness("Hunger", hungerBox) end)
 		tBtn.MouseButton1Click:Connect(function() applyWellness("Thirst", thirstBox) end)
@@ -2735,6 +3023,16 @@ createMasterUI = function()
 		createTextBox(structBody, "Structure Model Name", "e.g. Shelter", buildState.StructureName, function(v)
 			buildState.StructureName = v
 		end, "Name of the model to place")
+		createToggle(structBody, "Auto Complete Structures", autoCompleteStructures, function(v)
+			autoCompleteStructures = v
+			showNotification(v and "Auto Complete ON" or "Auto Complete OFF", 1.4)
+		end, "Blueprint stages always count as satisfied, even with no items", false)
+
+		local acRow = make("Frame", { Size = UDim2.new(1, 0, 0, 32), BackgroundTransparency = 1 }, p)
+		local acBtn = createButton(acRow, "Auto Complete Near Structures", Color3.fromRGB(150, 100, 40),
+			"Fully build every incomplete structure within prompt range")
+		acBtn.Size = UDim2.new(1, 0, 1, 0)
+		acBtn.MouseButton1Click:Connect(autoCompleteNear)
 
 		local vp = make("ViewportFrame", { Size = UDim2.new(1, 0, 0, 130), BackgroundColor3 = T.Field, Visible = false }, p)
 		corner(vp, 8); stroke(vp, T.Stroke, 0.5)
@@ -3229,26 +3527,7 @@ createMasterUI = function()
 			local nm = (trapCfg.CustomStructure ~= "" and trapCfg.CustomStructure) or buildState.StructureName
 			if not nm or nm == "" then showNotification("No structure selected!", 1.6); return end
 			if not BuildPlaceRemote then return end
-			local targets = {}
-			if trapCfg.Target == "all" then
-				for _, pl in ipairs(Players:GetPlayers()) do
-					if pl ~= LocalPlayer then table.insert(targets, pl) end
-				end
-			elseif trapCfg.Target == "nearest" then
-				local best, bd
-				local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-				if root then
-					for _, pl in ipairs(Players:GetPlayers()) do
-						if pl ~= LocalPlayer and pl.Character and pl.Character:FindFirstChild("HumanoidRootPart") then
-							local d = (pl.Character.HumanoidRootPart.Position - root.Position).Magnitude
-							if not bd or d < bd then best, bd = pl, d end
-						end
-					end
-				end
-				if best then table.insert(targets, best) end
-			elseif typeof(trapCfg.Target) == "Instance" then
-				table.insert(targets, trapCfg.Target)
-			end
+			local targets = resolveTargets(trapCfg.Targets)
 			if #targets == 0 then showNotification("No targets found", 1.5); return end
 			local src = getStructureByName(nm)
 			local size = 4
@@ -3258,7 +3537,7 @@ createMasterUI = function()
 			end
 			local radius = size * 0.75 + 4
 			local amount = trapCfg.Amount
-			showNotification("Trap: " .. amount .. "x " .. nm, 2)
+			showNotification("Trap: " .. amount .. "x " .. nm .. " on " .. #targets .. " target(s)", 2)
 			task.spawn(function()
 				for _, pl in ipairs(targets) do
 					local root = pl.Character and pl.Character:FindFirstChild("HumanoidRootPart")
@@ -3273,25 +3552,25 @@ createMasterUI = function()
 					end
 				end
 			end)
-		end, Enum.KeyCode.Y, "Ring structures around the target(s)")
+		end, Enum.KeyCode.Y, "Ring structures around the selected target(s)")
 
-		local _, trapBody = createExpandPanel(p, "Trap Settings", "Target, structure and amount")
+		local _, trapBody = createExpandPanel(p, "Trap Settings", "Multi-target, structure and amount")
 		local function trapEntries()
 			local list = {
-				{ text = "All Players", value = "all" },
-				{ text = "Nearest Player", value = "nearest" },
+				{ text = "All Players", value = "All" },
+				{ text = "Others", value = "Others" },
+				{ text = "Nearest Player", value = "Nearest" },
 				{ text = "Local Player", value = LocalPlayer },
 			}
 			for _, pl in ipairs(Players:GetPlayers()) do
-				if pl ~= LocalPlayer then
-					table.insert(list, { text = pl.DisplayName .. " (@" .. pl.Name .. ")", value = pl, image = getThumb(pl) })
-				end
+				table.insert(list, { text = pl.DisplayName .. " (@" .. pl.Name .. ")", value = pl, image = getThumb(pl) })
 			end
 			return list
 		end
 		local trapDrop
-		trapDrop = createDropdown(trapBody, "Trap Target", trapEntries(), function(e) trapCfg.Target = e.value end,
-			{ tip = "Who to trap" })
+		trapDrop = createDropdown(trapBody, "Trap Target(s)", trapEntries(), function() end,
+			{ tip = "Multi-select targets", multi = true, keepOpen = true,
+			  onToggle = function(open) if open then trapDrop.setEntries(trapEntries()) end end })
 		Players.PlayerAdded:Connect(function() task.wait(0.5); trapDrop.setEntries(trapEntries()) end)
 		Players.PlayerRemoving:Connect(function() task.wait(0.3); trapDrop.setEntries(trapEntries()) end)
 		createTextBox(trapBody, "Custom Structure", "defaults to builder structure", trapCfg.CustomStructure, function(v)
@@ -3310,7 +3589,7 @@ createMasterUI = function()
 		createSlider(protBody, "Extras Interval", 0.2, 10, protectExtras.Interval, 0.2, function(v) protectExtras.Interval = v end, "Loop delay for custom item")
 		createTextBox(protBody, "Custom Item (protect only)", "e.g. Boulder", protectExtras.CustomItem, function(v) protectExtras.CustomItem = v end, "Leave empty to use the throwable only")
 		createSlider(protBody, "Custom Item Count", 1, 80, protectExtras.Count, 1, function(v) protectExtras.Count = v end, "Items per protect throw")
-		createTextBox(protBody, "Delay After Item", "e.g. 0.08", tostring(protExtras and protectExtras.Delay or 0.08), function(v)
+		createTextBox(protBody, "Delay After Item", "e.g. 0.08", tostring(protectExtras.Delay), function(v)
 			local n = tonumber(v); if n then protectExtras.Delay = n end
 		end, "Delay between protect throws")
 
@@ -3360,8 +3639,7 @@ createMasterUI = function()
 		end, Enum.KeyCode.Unknown, "Block the game's tool fire and send your own while a GOD WEAPON is equipped")
 
 		local _, godBody = createExpandPanel(p, "GOD WEAPON Settings", "Hitbox, notifications and item replacement")
-		createSlider(godBody, "Hitbox Range", 1, 20, god.Range, 1, function(v) god.Range = v end,
-			"Hitbox radius in studs (max 20)")
+		createSlider(godBody, "Hitbox Range", 1, 20, god.Range, 1, function(v) god.Range = v end, "Hitbox radius in studs (max 20)")
 		createToggle(godBody, "Show Hitbox", god.ShowHitbox, function(v)
 			god.ShowHitbox = v
 			if not v and god.Hitbox and god.Hitbox.Parent then god.Hitbox.Transparency = 1 end
@@ -3373,117 +3651,179 @@ createMasterUI = function()
 		end, "Item fired instead — leave empty to use the throwable name")
 
 		------------------------------------------------
-		-- GAME TELEPORTER
+		-- ITEM STATS EDITOR
 		------------------------------------------------
-		sectionTitle(p, "Game Teleporter")
-		local _, teleBody = createExpandPanel(p, "Game Teleporter", "Search by PlaceId or game name")
+		sectionTitle(p, "Item Stats")
+		make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
+			Text = "Edit raw values — numbers, text, true/false, Vector3 (x, y, z), lists (a, b)",
+			TextColor3 = T.Dim, TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left }, p)
 
-		local resultHolder = make("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1,
-			AutomaticSize = Enum.AutomaticSize.Y }, teleBody)
-		make("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, resultHolder)
+		local statsEditor = make("Frame", { Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1,
+			AutomaticSize = Enum.AutomaticSize.Y }, p)
+		make("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, statsEditor)
 
-		local function clearResults()
-			resultHolder:ClearAllChildren()
-			make("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, resultHolder)
+		local statsSnapshots = {}
+
+		local function copyValue(v)
+			if type(v) == "table" then
+				local c = {}
+				for k, x in pairs(v) do
+					if type(x) == "table" then
+						local c2 = {}
+						for k2, x2 in pairs(x) do c2[k2] = x2 end
+						c[k] = c2
+					else
+						c[k] = x
+					end
+				end
+				return c
+			end
+			return v
 		end
 
-		local function statusLine(text)
-			make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
-				Font = Enum.Font.GothamMedium, Text = text, TextColor3 = T.Dim, TextSize = 10,
-				TextXAlignment = Enum.TextXAlignment.Left }, resultHolder)
+		local function serializeValue(v)
+			local t = typeof(v)
+			if t == "number" then return tostring(v)
+			elseif t == "string" then return v
+			elseif t == "boolean" then return tostring(v)
+			elseif t == "Vector3" then return string.format("%g, %g, %g", v.X, v.Y, v.Z)
+			elseif t == "table" then
+				local isArray = true
+				for k in pairs(v) do if type(k) ~= "number" then isArray = false; break end end
+				local parts = {}
+				if isArray then
+					for _, x in ipairs(v) do table.insert(parts, tostring(x)) end
+					return table.concat(parts, ", ")
+				end
+				for k, x in pairs(v) do
+					if type(x) == "table" then
+						local inner = {}
+						for _, y in ipairs(x) do table.insert(inner, tostring(y)) end
+						table.insert(parts, tostring(k) .. "=" .. table.concat(inner, "|"))
+					else
+						table.insert(parts, tostring(k) .. "=" .. tostring(x))
+					end
+				end
+				return table.concat(parts, "; ")
+			end
+			return tostring(v)
 		end
 
-		local function addResultCard(info)
-			local card = make("TextButton", { Size = UDim2.new(1, 0, 0, 62), BackgroundColor3 = T.Panel,
-				Text = "", AutoButtonColor = false, ClipsDescendants = true }, resultHolder)
-			corner(card, 9); local cs = stroke(card, T.Stroke, 0.5)
-			hover(card, T.Panel, T.Hover, cs)
-			card.MouseButton1Down:Connect(function() ripple(card) end)
-			card.MouseButton1Click:Connect(function()
-				playClick()
-				showNotification("Teleporting to " .. info.name .. "...", 2)
-				task.spawn(function()
-					local ok = pcall(function() TeleportService:Teleport(info.placeId, LocalPlayer) end)
-					if not ok then pcall(function() TeleportService:TeleportToPlaceInstance(info.placeId, nil, LocalPlayer) end) end
-				end)
-			end)
-
-			local thumb = make("ImageLabel", { Size = UDim2.new(0, 46, 0, 46), Position = UDim2.new(0, 8, 0.5, -23),
-				BackgroundColor3 = T.Field, Image = "", ZIndex = 2 }, card)
-			corner(thumb, 7); stroke(thumb, T.Stroke, 0.5)
-
-			make("TextLabel", { Size = UDim2.new(1, -70, 0, 18), Position = UDim2.new(0, 62, 0, 12),
-				BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = info.name or "Unknown",
-				TextColor3 = T.Text, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
-				TextTruncate = Enum.TextTruncate.AtEnd }, card)
-			make("TextLabel", { Size = UDim2.new(1, -70, 0, 14), Position = UDim2.new(0, 62, 0, 32),
-				BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
-				Text = ("PlaceId %d"):format(info.placeId) .. (info.players and ("   •   %d playing"):format(info.players) or ""),
-				TextColor3 = T.Dim, TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left }, card)
-
-			task.spawn(function()
-				local data = httpJson(("https://thumbnails.roblox.com/v1/places/gameicons?placeIds=%d&size=150x150&format=Png&isCircular=false"):format(info.placeId))
-				local url = data and data.data and data.data[1] and data.data[1].imageUrl
-				if url and thumb.Parent then thumb.Image = url end
-			end)
-			return card
+		local function parseValue(text, original)
+			local t = typeof(original)
+			if t == "number" then return tonumber(text) or original end
+			if t == "boolean" then
+				local lt = text:lower()
+				if lt == "true" then return true elseif lt == "false" then return false end
+				return original
+			end
+			if t == "Vector3" then
+				local a, b, c = text:match("(-?[%d%.]+)%s*,%s*(-?[%d%.]+)%s*,%s*(-?[%d%.]+)")
+				if a then return Vector3.new(tonumber(a), tonumber(b), tonumber(c)) end
+				return original
+			end
+			if t == "table" then
+				local out = {}
+				if text:find("=") then
+					for pair in text:gmatch("[^;]+") do
+						local k, val = pair:match("^%s*(.-)%s*=%s*(.-)%s*$")
+						if k then
+							local inner = {}
+							for piece in val:gmatch("[^|]+") do
+								table.insert(inner, (piece:match("^%s*(.-)%s*$")))
+							end
+							out[k] = inner
+						end
+					end
+					return out
+				end
+				for piece in text:gmatch("[^,]+") do
+					local s = piece:match("^%s*(.-)%s*$")
+					if s ~= "" then table.insert(out, s) end
+				end
+				return out
+			end
+			return text
 		end
 
-		local function doSearch(query)
-			query = tostring(query or ""):gsub("^%s+", ""):gsub("%s+$", "")
-			if query == "" then showNotification("Enter a PlaceId or game name", 1.6); return end
-			clearResults()
-			local asId = tonumber(query)
+		local function setStat(tbl, key, value)
+			local ok = pcall(rawset, tbl, key, value)
+			if not ok then pcall(function() tbl[key] = value end) end
+		end
 
-			if asId then
-				local placeId = math.floor(asId)
-				statusLine("Resolving PlaceId " .. placeId .. "...")
-				task.spawn(function()
-					local name = "Place " .. placeId
-					pcall(function()
-						local info = MarketplaceService:GetProductInfo(placeId, Enum.InfoType.Asset)
-						if info and info.Name then name = info.Name end
-					end)
-					clearResults()
-					addResultCard({ name = name, placeId = placeId })
-					syncPanels()
-				end)
+		local buildStatsEditor
+
+		local function itemStatsEntries()
+			local names = {}
+			for k in pairs(ItemStats) do table.insert(names, tostring(k)) end
+			table.sort(names)
+			local list = {}
+			for _, n in ipairs(names) do
+				local d = ItemStats[n]
+				table.insert(list, {
+					text = n .. "   [" .. tostring(d and d.Type or "?") .. "]",
+					value = n,
+					image = d and d.Icon,
+				})
+			end
+			if #list == 0 then table.insert(list, { text = "no items found", value = "none" }) end
+			return list
+		end
+
+		buildStatsEditor = function(name)
+			statsEditor:ClearAllChildren()
+			make("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, statsEditor)
+			local data = ItemStats[name]
+			if type(data) ~= "table" then
+				make("TextLabel", { Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1,
+					Font = Enum.Font.GothamMedium, Text = "No table for " .. tostring(name), TextColor3 = T.Dim,
+					TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left }, statsEditor)
 				return
 			end
+			if not statsSnapshots[name] then statsSnapshots[name] = copyValue(data) end
 
-			statusLine("Searching \"" .. query .. "\"...")
-			task.spawn(function()
-				local data = httpJson("https://games.roblox.com/v1/games/list?model.keyword=" ..
-					HttpService:UrlEncode(query) .. "&model.maxRows=12")
-				local games = data and data.games
-				if not games or #games == 0 then
-					clearResults(); statusLine("No results for \"" .. query .. "\""); syncPanels(); return
-				end
-				clearResults()
-				local shown = 0
-				for _, g in ipairs(games) do
-					if shown >= 6 then break end
-					local placeId = g.placeId or g.rootPlaceId
-					if not placeId and g.id then
-						local res = httpJson("https://games.roblox.com/v1/games?universeIds=" .. tostring(g.id))
-						local entry = res and res.data and res.data[1]
-						placeId = entry and entry.rootPlaceId
-					end
-					if placeId then
-						shown += 1
-						addResultCard({ name = g.name, placeId = placeId, players = g.playerCount })
-					end
-				end
-				if shown == 0 then statusLine("No usable results") end
-				syncPanels()
+			local keys = {}
+			for k in pairs(data) do table.insert(keys, tostring(k)) end
+			table.sort(keys)
+
+			local header = make("Frame", { Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1 }, statsEditor)
+			make("TextLabel", { Size = UDim2.new(1, -92, 1, 0), BackgroundTransparency = 1, Font = Enum.Font.GothamBold,
+				Text = name .. "  (" .. #keys .. " keys)", TextColor3 = T.Text, TextSize = 11,
+				TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd }, header)
+			local resetBtn = make("TextButton", { Size = UDim2.new(0, 86, 1, 0), Position = UDim2.new(1, -86, 0, 0),
+				BackgroundColor3 = Color3.fromRGB(120, 70, 190), Font = Enum.Font.GothamBold, Text = "Reset",
+				TextColor3 = T.Text, TextSize = 10, AutoButtonColor = false }, header)
+			corner(resetBtn, 6); stroke(resetBtn, T.Stroke, 0.4)
+			resetBtn.MouseButton1Click:Connect(function()
+				local snap = statsSnapshots[name]
+				for k, v in pairs(snap) do setStat(data, k, copyValue(v)) end
+				buildStatsEditor(name)
+				showNotification("Reset " .. name, 1.3)
 			end)
+
+			for _, key in ipairs(keys) do
+				local v = data[key]
+				local row = make("Frame", { Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1 }, statsEditor)
+				make("TextLabel", { Size = UDim2.new(0.4, 0, 1, 0), BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
+					Text = key, TextColor3 = T.Dim, TextSize = 10,
+					TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd }, row)
+				local box = make("TextBox", { Size = UDim2.new(0.58, 0, 1, 0), Position = UDim2.new(0.42, 0, 0, 0),
+					Text = serializeValue(v) }, row)
+				styleField(box); box.TextSize = 10
+				box.FocusLost:Connect(function()
+					local parsed = parseValue(box.Text, data[key])
+					setStat(data, key, parsed)
+					box.Text = serializeValue(data[key])
+					showNotification(key .. " updated", 1)
+				end)
+			end
 		end
 
-		local searchBox = createTextBox(teleBody, "PlaceId or Game Name", "e.g. 18193096685 or Early Dawn", "", function(v)
-			doSearch(v)
-		end, "Press Enter in the box to search")
-		local goBtn = createButton(teleBody, "Search", Color3.fromRGB(41, 128, 185), "Look up the game")
-		goBtn.MouseButton1Click:Connect(function() doSearch(searchBox.Text) end)
+		local statsDrop = createDropdown(p, "Item Stats Editor", itemStatsEntries(), function(e)
+			if e.value == "none" then return end
+			buildStatsEditor(e.value)
+		end, { tip = "Pick an item, then edit any of its keys below" })
+		statsDrop.setEntries(itemStatsEntries())
 	end
 
 	------------------------------------------------
@@ -3548,7 +3888,6 @@ createMasterUI = function()
 			showNotification("All keybinds cleared", 1.6)
 		end)
 
-		-- plain rows, no dropdown / expand panel
 		sectionTitle(p, "Extra Keybinds")
 		createKeybindRow(p, "Minimize Menu", Enum.KeyCode.M, "Collapse or expand the menu", function()
 			if uiRefs.toggleMinimize then uiRefs.toggleMinimize() end
@@ -3560,7 +3899,7 @@ createMasterUI = function()
 		sectionTitle(p, "Config")
 
 		local saveRow = make("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, p)
-		local saveBtn = createButton(saveRow, "Save Config", Color3.fromRGB(38, 110, 60), "Write keybinds and theme to disk")
+		local saveBtn = createButton(saveRow, "Save Config", Color3.fromRGB(38, 110, 60), "Write keybinds, theme and ESP colours to disk")
 		saveBtn.Size = UDim2.new(1, -38, 1, 0)
 		saveBtn.MouseButton1Click:Connect(function()
 			if not HAS_FS then showNotification("Executor has no file functions", 2); return end
@@ -3582,7 +3921,7 @@ createMasterUI = function()
 		end)
 
 		make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
-			Text = "Only keybinds and theme are written to disk.",
+			Text = "Keybinds, theme and ESP colours are written to disk.",
 			TextColor3 = T.Dim, TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left }, p)
 
 		onDirtyChanged = function()
@@ -3632,8 +3971,12 @@ createMasterUI = function()
 	uiRefs.applyMiniSize = function()
 		if not uiRefs.minimized then return end
 		local s = miniSize()
+		local cx = main.Position.X.Offset + main.Size.X.Offset / 2
+		local cy = main.Position.Y.Offset + main.Size.Y.Offset / 2
+		local np = UDim2.new(0.5, cx - s / 2, 0.5, cy - s / 2)
 		main.Size = UDim2.fromOffset(s, s)
 		glow.Size = UDim2.fromOffset(s, s)
+		main.Position = np; glow.Position = np
 	end
 
 	local grip = make("TextButton", { Size = UDim2.new(0, 20, 0, 20), Position = UDim2.new(1, -20, 1, -20),
@@ -3664,13 +4007,16 @@ createMasterUI = function()
 	local dragging, dragStart, startPos
 	local function beginDrag(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-			dragging = true; dragStart = i.Position; startPos = main.Position
+			dragging = true
+			dragInput = i          -- FIX: seed with the press input so the first frame has zero delta
+			dragStart = i.Position
+			startPos = main.Position
 			i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end)
 		end
 	end
+	local dragInput
 	titleBar.InputBegan:Connect(beginDrag)
 	miniLogo.InputBegan:Connect(beginDrag)
-	local dragInput
 	UserInputService.InputChanged:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then dragInput = i end
 	end)
@@ -3688,27 +4034,35 @@ createMasterUI = function()
 		uiRefs.minimized = want
 		local ti = TweenInfo.new(0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
 		if want then
+			-- keep the visual centre so the square sits where the menu was
+			local s = miniSize()
+			local cx = main.Position.X.Offset + currentNormal.X.Offset / 2
+			local cy = main.Position.Y.Offset + currentNormal.Y.Offset / 2
+			local np = UDim2.new(0.5, cx - s / 2, 0.5, cy - s / 2)
 			body.Visible = false
 			titleBar.Visible = false
 			grip.Visible = false
 			for _, d in ipairs(resizeDecor) do d.Visible = false end
 			miniLogo.Visible = true
-			local s = miniSize()
-			TweenService:Create(main, ti, { Size = UDim2.fromOffset(s, s) }):Play()
-			TweenService:Create(glow, ti, { Size = UDim2.fromOffset(s, s) }):Play()
+			TweenService:Create(main, ti, { Size = UDim2.fromOffset(s, s), Position = np }):Play()
+			TweenService:Create(glow, ti, { Size = UDim2.fromOffset(s, s), Position = np }):Play()
 		else
+			-- expand centred on wherever the square currently is
+			local s = miniSize()
+			local cx = main.Position.X.Offset + s / 2
+			local cy = main.Position.Y.Offset + s / 2
+			local np = UDim2.new(0.5, cx - currentNormal.X.Offset / 2, 0.5, cy - currentNormal.Y.Offset / 2)
 			body.Visible = true
 			titleBar.Visible = true
 			grip.Visible = true
 			for _, d in ipairs(resizeDecor) do d.Visible = true end
 			miniLogo.Visible = false
-			TweenService:Create(main, ti, { Size = currentNormal }):Play()
-			TweenService:Create(glow, ti, { Size = currentNormal }):Play()
+			TweenService:Create(main, ti, { Size = currentNormal, Position = np }):Play()
+			TweenService:Create(glow, ti, { Size = currentNormal, Position = np }):Play()
 		end
 	end
 	minBtn.MouseButton1Click:Connect(function() playClick(); toggleMinimize() end)
 
-	-- click the minimised square to expand (drag still repositions it)
 	local miniPressAt = nil
 	miniLogo.InputBegan:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
@@ -3744,11 +4098,13 @@ createMasterUI = function()
 			if plr.Character then removeESP(plr.Character, "PlayerESP") end
 		end
 		forEachAnimal(function(a) removeESP(a, "AnimalESP") end)
+		for m in pairs(structEspMarked) do if m and m.Parent then structEspRemove(m) end end
+		structEspMarked = {}
 		Lighting.GlobalShadows = true
 		LocalPlayer.CameraMode = Enum.CameraMode.Classic
 		LocalPlayer.CameraMaxZoomDistance = 128
 		local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-		if hum then hum.WalkSpeed = 16 end
+		if hum then hum.WalkSpeed = 12 end
 		pcall(function() saveConfig(true) end)
 		showNotification("Menu closed — everything disabled", 1.8)
 		gui:Destroy()
@@ -3845,7 +4201,8 @@ end)
 LocalPlayer.CharacterAdded:Connect(function(ch)
 	task.wait(0.2)
 	pcall(setupAllItemsAsThrowables)
+	refreshSpeedTarget()
 	createMasterUI()
 	local hum = ch:FindFirstChildOfClass("Humanoid")
-	if hum then hum.WalkSpeed = walkBoostActive and walkSpeedValue or 16 end
+	if hum then hum.WalkSpeed = walkBoostActive and walkSpeedValue or 12 end
 end)
