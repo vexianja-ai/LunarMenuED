@@ -1,5 +1,12 @@
 --[[
-	LUNAR MENU — v2.3.0
+	LUNAR MENU — v2.4.0
+	+ Builder rewritten: in-world construct sandbox, tool inventory (undo / redo / move / copy / rotate / delete / camera)
+	+ Move + rotate gizmo axes, draggable on PC and mobile, dotted tether line, increments in Construct Settings
+	+ Freecam (WASD / drag / Q-E zoom on PC, thumbstick / drag / draggable zoom buttons on mobile)
+	+ Ctrl+C clone, Ctrl+X delete, Ctrl+Z undo, Ctrl+S redo, Ctrl+D rotate 90° right, 1-7 tool select, Shift multi-select
+	+ Build / Cancel ask "Are you sure?"
+	+ Structure picker: text field or big dropdown (scans structures, item models and throwables)
+	+ Item Stats: Save to disk + Cancel restore
 	+ Auto Complete rewritten: prompts forced to HoldDuration 0, BuildBlueprintAdd fired directly
 	    (5 materials x 4 rounds per stage, 8 rounds for Thatch Hut / Mud, skips Fiber Basket & Fire Pit)
 	    "not" -> "can" interceptor kept as a fallback for manual presses
@@ -249,7 +256,7 @@ end
 ----------------------------------------------------
 local LOGO_ID = "rbxassetid://8498174594"
 local KEYBIND_IMG = "rbxassetid://126810011338788"
-local VERSION = "v2.3.0"
+local VERSION = "v2.4.0"
 
 local function make(class, props, parent)
 	local i = Instance.new(class)
@@ -378,8 +385,31 @@ local buildState = {
 	IsConstructing = false,
 	BoundingBoxPart = nil,
 	RenderConnection = nil,
-	ViewportViewModel = nil,
-	ViewportCharModel = nil
+}
+
+----------------------------------------------------
+-- SANDBOX (in-world construction)
+----------------------------------------------------
+local sandbox = {
+	Active = false,
+	Folder = nil,
+	GizmoFolder = nil,
+	DotsFolder = nil,
+	Dots = {},
+	Items = {},
+	Selected = {},
+	Tool = nil,
+	History = {},
+	RedoStack = {},
+	MoveIncrement = 1,
+	RotateIncrement = 15,
+	RespectTerrain = true,
+	Drag = nil,
+	UI = nil,
+	BuildName = "Shelter",
+	Refs = {},
+	Actions = {},
+	Freecam = { Active = false },
 }
 
 ----------------------------------------------------
@@ -420,6 +450,13 @@ local function getStructureByName(modelName)
 	end
 	local itemModels = assets:FindFirstChild("ItemModels")
 	if itemModels then table.insert(roots, itemModels) end
+	local items = assets:FindFirstChild("Items")
+	local im = items and items:FindFirstChild("ItemModels")
+	if im then
+		local th = im:FindFirstChild("Throwables")
+		if th then table.insert(roots, th) end
+		table.insert(roots, im)
+	end
 	for _, root in ipairs(roots) do
 		local found = findStructureModel(root, modelName)
 		if found then return found end
@@ -1069,6 +1106,8 @@ local SAVE_FILE = SAVE_FOLDER .. "/config.json"
 local FALLBACK_FILE = "LunarMenu_config.json"
 local MOBILE_FILE = SAVE_FOLDER .. "/mobilebuttons.json"
 local MOBILE_FALLBACK = "LunarMenu_mobilebuttons.json"
+local STATS_FILE = SAVE_FOLDER .. "/itemstats.json"
+local STATS_FALLBACK = "LunarMenu_itemstats.json"
 local HAS_FS = (type(writefile) == "function" and type(readfile) == "function")
 local saveQueued = false
 local saveDirty = false
@@ -1163,6 +1202,88 @@ local function loadConfig()
 end
 
 pcall(loadConfig)
+
+----------------------------------------------------
+-- ITEM STATS PERSISTENCE
+----------------------------------------------------
+local function encodeStatValue(v)
+	local t = typeof(v)
+	if t == "number" or t == "string" or t == "boolean" then return { t = t, v = v } end
+	if t == "Vector3" then return { t = "v3", v = { v.X, v.Y, v.Z } } end
+	if t == "Color3" then return { t = "c3", v = { v.R, v.G, v.B } } end
+	if t == "table" then
+		local out = { t = "tbl", v = {} }
+		for k, x in pairs(v) do
+			if type(k) == "string" or type(k) == "number" then
+				local enc = encodeStatValue(x)
+				if enc then out.v[tostring(k)] = enc end
+			end
+		end
+		return out
+	end
+	return nil
+end
+
+local function decodeStatValue(e)
+	if type(e) ~= "table" then return nil end
+	if e.t == "number" or e.t == "string" or e.t == "boolean" then return e.v end
+	if e.t == "v3" and type(e.v) == "table" then return Vector3.new(e.v[1] or 0, e.v[2] or 0, e.v[3] or 0) end
+	if e.t == "c3" and type(e.v) == "table" then return Color3.new(e.v[1] or 0, e.v[2] or 0, e.v[3] or 0) end
+	if e.t == "tbl" and type(e.v) == "table" then
+		local out = {}
+		for k, x in pairs(e.v) do
+			out[tonumber(k) or k] = decodeStatValue(x)
+		end
+		return out
+	end
+	return nil
+end
+
+local function saveItemStatsToDisk()
+	if not HAS_FS then showNotification("Executor has no file functions", 2); return false end
+	local dump = {}
+	for name, data in pairs(ItemStats) do
+		if type(data) == "table" then
+			local row = {}
+			for k, v in pairs(data) do
+				local enc = encodeStatValue(v)
+				if enc then row[tostring(k)] = enc end
+			end
+			dump[tostring(name)] = row
+		end
+	end
+	local ok, encoded = pcall(function() return HttpService:JSONEncode(dump) end)
+	if not ok or not encoded then showNotification("Encode failed", 1.8); return false end
+	local target = ensureSaveFolder() and STATS_FILE or STATS_FALLBACK
+	local wrote = pcall(function() writefile(target, encoded) end)
+	if not wrote then wrote = pcall(function() writefile(STATS_FALLBACK, encoded) end) end
+	return wrote and true or false
+end
+
+local function loadItemStatsFromDisk()
+	if not HAS_FS then return end
+	local raw
+	for _, path in ipairs({ STATS_FILE, STATS_FALLBACK }) do
+		if fileExists(path) then
+			local ok, r = pcall(readfile, path)
+			if ok and r and r ~= "" then raw = r; break end
+		end
+	end
+	if not raw then return end
+	local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
+	if not ok or type(data) ~= "table" then return end
+	for name, row in pairs(data) do
+		local target = ItemStats[name]
+		if type(target) == "table" and type(row) == "table" then
+			for k, enc in pairs(row) do
+				local v = decodeStatValue(enc)
+				if v ~= nil then pcall(rawset, target, k, v) end
+			end
+		end
+	end
+end
+
+pcall(loadItemStatsFromDisk)
 
 ----------------------------------------------------
 -- MOBILE BUTTON DRAGGER
@@ -1303,10 +1424,8 @@ local function autoCompleteStructure(model)
 		local idx = model:GetAttribute("CurrentStageIndex")
 		if idx == nil or not model.Parent then break end
 		local stageName = "Stage" .. (idx + 1)
-		-- instant prompt trigger: makes the server create its one-shot listener
 		pcall(function() prompt:InputHoldBegin() end)
 		pcall(function() prompt:InputHoldEnd() end)
-		-- fire the remote manually, all arguments, every material, repeated
 		for _ = 1, rounds do
 			for _, mat in ipairs(AUTO_MATERIALS) do
 				if BuildBlueprintAdd then
@@ -1359,7 +1478,6 @@ local function autoCompleteNear()
 	end)
 end
 
--- keep every structure prompt instant while the switch is on
 task.spawn(function()
 	while task.wait(1) do
 		if autoCompleteStructures then
@@ -1726,7 +1844,7 @@ UserInputService.InputBegan:Connect(function(input, gp)
 		return
 	end
 
-	if throwEnabled and not concurrent.Active then
+	if throwEnabled and not concurrent.Active and not sandbox.Active then
 		local pos, hit = getClickPosition()
 		throwAt(pos, hit)
 	end
@@ -2346,7 +2464,7 @@ createMasterUI = function()
 		local arrow = make("TextLabel", { Size = UDim2.new(0, 30, 1, 0), Position = UDim2.new(1, -38, 0, 0),
 			BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "v", TextColor3 = T.Accent, TextSize = 13 }, header)
 
-		local listH = math.min(#entries * 30 + 12, 180)
+		local listH = math.min(#entries * 30 + 12, opts.maxHeight or 180)
 		local extraH = opts.extraHeight or 0
 		local contentBox = make("Frame", { Size = UDim2.new(1, 0, 0, listH + extraH + 16), Position = UDim2.new(0, 0, 0, 42),
 			BackgroundColor3 = T.Bg2, BackgroundTransparency = 0.05, Visible = false }, container)
@@ -2390,7 +2508,7 @@ createMasterUI = function()
 			list:ClearAllChildren()
 			make("UIListLayout", { Padding = UDim.new(0, 4) }, list)
 			rowLabels, rowBase = {}, {}
-			listH = math.min(#newEntries * 30 + 12, 180)
+			listH = math.min(#newEntries * 30 + 12, opts.maxHeight or 180)
 			for idx, e in ipairs(newEntries) do
 				local row = make("TextButton", { Size = UDim2.new(1, 0, 0, 28), Position = UDim2.new(-0.3, 0, 0, 0),
 					BackgroundColor3 = T.PanelD, Text = "", AutoButtonColor = false, ClipsDescendants = true }, list)
@@ -2716,44 +2834,6 @@ createMasterUI = function()
 			panel:Destroy()
 			showNotification("Custom shape saved (" .. #points .. " points)", 2)
 		end)
-	end
-
-	------------------------------------------------
-	-- AXIS ARROWS
-	------------------------------------------------
-	local AXIS_DEFS = {
-		{dir = Vector3.new(1, 0, 0), color = Color3.fromRGB(255, 70, 70), text = "+X", rot = CFrame.Angles(0, math.rad(90), 0)},
-		{dir = Vector3.new(-1, 0, 0), color = Color3.fromRGB(170, 40, 40), text = "-X", rot = CFrame.Angles(0, math.rad(90), 0)},
-		{dir = Vector3.new(0, 1, 0), color = Color3.fromRGB(70, 255, 130), text = "+Y", rot = CFrame.Angles(math.rad(-90), 0, 0)},
-		{dir = Vector3.new(0, -1, 0), color = Color3.fromRGB(40, 170, 80), text = "-Y", rot = CFrame.Angles(math.rad(-90), 0, 0)},
-		{dir = Vector3.new(0, 0, 1), color = Color3.fromRGB(90, 150, 255), text = "+Z", rot = CFrame.Angles(0, 0, 0)},
-		{dir = Vector3.new(0, 0, -1), color = Color3.fromRGB(50, 80, 180), text = "-Z", rot = CFrame.Angles(0, 0, 0)},
-	}
-	local function createAxisArrows(parent, length)
-		local arrows = {}
-		for _, d in ipairs(AXIS_DEFS) do
-			local part = Instance.new("Part")
-			part.Name = "Axis_" .. d.text
-			part.Anchored = true; part.CanCollide = false; part.CanQuery = false; part.CastShadow = false
-			part.Material = Enum.Material.Neon; part.Size = Vector3.new(0.09, 0.09, length); part.Color = d.color
-			part.Parent = parent
-			local bb = make("BillboardGui", { Size = UDim2.new(0, 26, 0, 14), AlwaysOnTop = true, StudsOffset = Vector3.new(0, 0.35, 0) }, part)
-			make("TextLabel", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = d.text,
-				TextColor3 = d.color, TextStrokeTransparency = 0, Font = Enum.Font.GothamBold, TextSize = 10 }, bb)
-			table.insert(arrows, { part = part, dir = d.dir, rot = d.rot })
-		end
-		return arrows
-	end
-	local function updateAxisArrows(arrows, baseCF, baseSize, clearance)
-		local ext = math.min(baseSize.X, baseSize.Y, baseSize.Z) * 0.5 + (clearance or 0.5)
-		for _, a in ipairs(arrows) do
-			if a.part.Parent then
-				a.part.CFrame = baseCF * CFrame.new(a.dir * (ext + a.part.Size.Z * 0.5)) * a.rot
-			end
-		end
-	end
-	local function clearAxisArrows(arrows)
-		for _, a in ipairs(arrows) do a.part:Destroy() end
 	end
 
 	------------------------------------------------
@@ -3184,227 +3264,986 @@ createMasterUI = function()
 	------------------------------------------------
 	do
 		local p = PAGE.Builder
-		sectionTitle(p, "Structure")
 
-		local _, structBody = createExpandPanel(p, "Structure Settings", "Which model gets placed")
-		createTextBox(structBody, "Structure Model Name", "e.g. Shelter", buildState.StructureName, function(v)
-			buildState.StructureName = v
-		end, "Name of the model to place")
-		createToggle(structBody, "Auto Complete Structures", autoCompleteStructures, function(v)
-			autoCompleteStructures = v
-			showNotification(v and "Auto Complete ON" or "Auto Complete OFF", 1.4)
-		end, "Blueprint stages always count as satisfied, even with no items", false)
-
-		local acRow = make("Frame", { Size = UDim2.new(1, 0, 0, 32), BackgroundTransparency = 1 }, p)
-		local acBtn = createButton(acRow, "Auto Complete Near Structures", Color3.fromRGB(150, 100, 40),
-			"Fully build every incomplete structure within prompt range")
-		acBtn.Size = UDim2.new(1, 0, 1, 0)
-		acBtn.MouseButton1Click:Connect(autoCompleteNear)
-
-		local vp = make("ViewportFrame", { Size = UDim2.new(1, 0, 0, 130), BackgroundColor3 = T.Field, Visible = false }, p)
-		corner(vp, 8); stroke(vp, T.Stroke, 0.5)
-		local vpCam = newViewportCamera(vp); vp.CurrentCamera = vpCam
-		local vpWorld = make("WorldModel", {}, vp)
-		local vpArrows = {}
-
-		local function offsetVector()
-			local o = buildState.AxisOffset
-			return Vector3.new(o.X, o.Y, -5 + o.Z)
-		end
-		local function baseCFrame()
-			return CFrame.new(offsetVector()) * CFrame.Angles(
-				math.rad(buildState.Rotation.X), math.rad(buildState.Rotation.Y), math.rad(buildState.Rotation.Z))
-		end
-
-		local function refreshViewport()
-			if buildState.ViewportViewModel then
-				if buildState.ViewportViewModel:IsA("Model") then
-					buildState.ViewportViewModel:PivotTo(baseCFrame())
-				else
-					buildState.ViewportViewModel.CFrame = baseCFrame()
+		-- ============================================================
+		-- SANDBOX CORE
+		-- ============================================================
+		local function overUi()
+			local mp = UserInputService:GetMouseLocation()
+			local function inside(f)
+				if not f or not f.Parent then return false end
+				local ap, as = f.AbsolutePosition, f.AbsoluteSize
+				return mp.X >= ap.X and mp.X <= ap.X + as.X and mp.Y >= ap.Y and mp.Y <= ap.Y + as.Y
+			end
+			if uiRefs.mainFrame and not uiRefs.minimized and inside(uiRefs.mainFrame) then return true end
+			if sandbox.UI then
+				for _, d in ipairs(sandbox.UI:GetDescendants()) do
+					if d:IsA("GuiObject") and d.Visible and inside(d) then return true end
 				end
 			end
-			updateAxisArrows(vpArrows, baseCFrame(), buildState.VMSize or Vector3.new(4, 4, 4), 0.4)
+			return false
 		end
 
-		local function setupViewport(name)
-			vpWorld:ClearAllChildren()
-			clearAxisArrows(vpArrows)
-			vpArrows = createAxisArrows(vpWorld, 3)
-			if LocalPlayer.Character then
-				LocalPlayer.Character.Archivable = true
-				local clone = LocalPlayer.Character:Clone()
-				LocalPlayer.Character.Archivable = false
-				clone.Parent = vpWorld
-				if clone:IsA("Model") then clone:PivotTo(CFrame.new(0, 0, 0)) end
-				buildState.ViewportCharModel = clone
+		local function ensureFolder()
+			local f = sandbox.Folder
+			if not f or not f.Parent then
+				f = Workspace:FindFirstChild("LunarSandbox") or Instance.new("Folder")
+				f.Name = "LunarSandbox"
+				f.Parent = Workspace
+				sandbox.Folder = f
 			end
+			return f
+		end
+
+		local function ensureGizmoFolder()
+			local f = sandbox.GizmoFolder
+			if not f or not f.Parent then
+				f = Workspace:FindFirstChild("LunarGizmo") or Instance.new("Folder")
+				f.Name = "LunarGizmo"
+				f.Parent = Workspace
+				sandbox.GizmoFolder = f
+			end
+			return f
+		end
+
+		local function ensureDotsFolder()
+			local f = sandbox.DotsFolder
+			if not f or not f.Parent then
+				f = Workspace:FindFirstChild("LunarDots") or Instance.new("Folder")
+				f.Name = "LunarDots"
+				f.Parent = Workspace
+				sandbox.DotsFolder = f
+			end
+			return f
+		end
+
+		local function snap(v, inc)
+			if not inc or inc <= 0 then return v end
+			return math.floor(v / inc + 0.5) * inc
+		end
+
+		local function pivotOf(rec) return rec.model:GetPivot() end
+
+		local function selectionCenter()
+			local sum, n = Vector3.zero, 0
+			for rec in pairs(sandbox.Selected) do
+				if rec.model and rec.model.Parent then
+					sum += pivotOf(rec).Position
+					n += 1
+				end
+			end
+			if n == 0 then return nil end
+			return sum / n
+		end
+
+		-- ---------- history ----------
+		local function pushHistory(undoFn, redoFn)
+			table.insert(sandbox.History, { undo = undoFn, redo = redoFn })
+			if #sandbox.History > 80 then table.remove(sandbox.History, 1) end
+			sandbox.RedoStack = {}
+		end
+
+		local function doUndo()
+			local a = table.remove(sandbox.History)
+			if not a then showNotification("Nothing to undo", 1.2); return end
+			sandbox.Selected = {}
+			pcall(a.undo)
+			table.insert(sandbox.RedoStack, a)
+			refreshGizmo()
+		end
+
+		local function doRedo()
+			local a = table.remove(sandbox.RedoStack)
+			if not a then showNotification("Nothing to redo", 1.2); return end
+			sandbox.Selected = {}
+			pcall(a.redo)
+			table.insert(sandbox.History, a)
+			refreshGizmo()
+		end
+
+		-- ---------- selection ----------
+		local function addSelHighlight(rec)
+			if rec.model:FindFirstChild("LunarSel") then return end
+			local h = Instance.new("Highlight")
+			h.Name = "LunarSel"
+			h.FillColor = T.Accent
+			h.FillTransparency = 0.72
+			h.OutlineColor = T.Accent2
+			h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+			h.Parent = rec.model
+		end
+
+		local function clearSelection()
+			for rec in pairs(sandbox.Selected) do
+				if rec.model then
+					local h = rec.model:FindFirstChild("LunarSel")
+					if h then h:Destroy() end
+				end
+			end
+			sandbox.Selected = {}
+			refreshGizmo()
+			clearDots()
+		end
+
+		local function selectRec(rec, additive)
+			if not additive then clearSelection() end
+			sandbox.Selected[rec] = true
+			addSelHighlight(rec)
+			refreshGizmo()
+		end
+
+		-- ---------- dots ----------
+		local function clearDots()
+			for _, d in ipairs(sandbox.Dots) do if d and d.Parent then d:Destroy() end end
+			sandbox.Dots = {}
+		end
+
+		local function updateDots(from, to, phase)
+			local dist = (to - from).Magnitude
+			if dist < 0.4 then clearDots(); return end
+			local folder = ensureDotsFolder()
+			local step = 1.15
+			local count = math.clamp(math.floor(dist / step), 1, 160)
+			while #sandbox.Dots < count do
+				local d = Instance.new("Part")
+				d.Shape = Enum.PartType.Ball
+				d.Size = Vector3.new(0.16, 0.16, 0.16)
+				d.Anchored = true; d.CanCollide = false; d.CanQuery = false; d.CastShadow = false
+				d.Material = Enum.Material.Neon
+				d.Color = T.Accent2
+				d.Parent = folder
+				table.insert(sandbox.Dots, d)
+			end
+			local shift = (phase or 0) % 1
+			for i = 1, #sandbox.Dots do
+				local d = sandbox.Dots[i]
+				if i <= count then
+					local t = ((i - 1) + shift) / count
+					d.CFrame = CFrame.new(from:Lerp(to, math.clamp(t, 0, 1)))
+					d.Transparency = 0.15 + 0.6 * (i / count)
+					d.Size = Vector3.new(0.16, 0.16, 0.16)
+				else
+					d.Transparency = 1
+				end
+			end
+		end
+
+		-- ---------- gizmo ----------
+		local function clearGizmo()
+			if sandbox.GizmoFolder then
+				for _, d in ipairs(sandbox.GizmoFolder:GetChildren()) do d:Destroy() end
+			end
+		end
+
+		local function gizmoPart(color, name, attrName, attrVal)
+			local part = Instance.new("Part")
+			part.Name = name
+			part.Anchored = true; part.CanCollide = false; part.CanQuery = true; part.CanTouch = false; part.CastShadow = false
+			part.Material = Enum.Material.Neon
+			part.Color = color
+			part.Size = Vector3.new(0.15, 0.15, 3)
+			part:SetAttribute(attrName, attrVal)
+			part.Parent = ensureGizmoFolder()
+			return part
+		end
+
+		local function buildGizmo()
+			clearGizmo()
+			if sandbox.Freecam.Active then return end
+			if next(sandbox.Selected) == nil then return end
+			if sandbox.Tool == "move" then
+				for _, ax in ipairs({ "X", "Y", "Z" }) do
+					local col = ax == "X" and Color3.fromRGB(255, 85, 85)
+						or ax == "Y" and Color3.fromRGB(90, 255, 130)
+						or Color3.fromRGB(95, 155, 255)
+					local part = gizmoPart(col, "GizmoMove" .. ax, "axis", ax)
+					local bb = make("BillboardGui", { Size = UDim2.new(0, 26, 0, 14), AlwaysOnTop = true }, part)
+					make("TextLabel", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = ax,
+						TextColor3 = col, TextStrokeTransparency = 0, Font = Enum.Font.GothamBold, TextSize = 11 }, bb)
+				end
+			elseif sandbox.Tool == "rotate" then
+				for i = 0, 23 do
+					local part = gizmoPart(Color3.fromRGB(255, 210, 90), "GizmoRot", "idx", i)
+					part.Size = Vector3.new(0.15, 0.15, 1)
+				end
+			end
+		end
+
+		local function refreshGizmo()
+			buildGizmo()
+		end
+
+		local function updateGizmo()
+			if not sandbox.GizmoFolder then return end
+			local center = selectionCenter()
+			if not center then return end
+			local cam = Workspace.CurrentCamera
+			local scale = (cam.CFrame.Position - center).Magnitude * 0.085 + 1.4
+			for _, part in ipairs(sandbox.GizmoFolder:GetChildren()) do
+				if part.Name:find("GizmoMove") then
+					local ax = part:GetAttribute("axis") or "X"
+					local dir = Vector3.new(ax == "X" and 1 or 0, ax == "Y" and 1 or 0, ax == "Z" and 1 or 0)
+					part.Size = Vector3.new(0.13 * scale, 0.13 * scale, 2.6 * scale)
+					local tip = center + dir * (2.2 * scale)
+					part.CFrame = CFrame.lookAt(tip, tip + dir)
+				elseif part.Name == "GizmoRot" then
+					local idx = part:GetAttribute("idx") or 0
+					local ang = (idx / 24) * math.pi * 2
+					local rad = 4 * scale
+					part.Size = Vector3.new(0.13 * scale, 0.13 * scale, (math.pi * 2 * rad) / 26)
+					part.CFrame = CFrame.new(center + Vector3.new(math.cos(ang), 0, math.sin(ang)) * rad)
+						* CFrame.Angles(0, -ang + math.pi / 2, 0)
+				end
+			end
+		end
+
+		-- ---------- pick ----------
+		local function cursorRay()
+			local mp = UserInputService:GetMouseLocation()
+			return Workspace.CurrentCamera:ViewportPointToRay(mp.X, mp.Y)
+		end
+
+		local function pickRec()
+			if not sandbox.Folder then return nil end
+			local ray = cursorRay()
+			local rp = RaycastParams.new()
+			rp.FilterType = Enum.RaycastFilterType.Include
+			rp.FilterDescendantsInstances = { sandbox.Folder }
+			local res = Workspace:Raycast(ray.Origin, ray.Direction * 3000, rp)
+			if not res then return nil end
+			local node = res.Instance
+			while node and node.Parent ~= sandbox.Folder do node = node.Parent end
+			if not node then return nil end
+			for _, rec in ipairs(sandbox.Items) do
+				if rec.model == node then return rec end
+			end
+			return nil
+		end
+
+		local function pickGizmo()
+			if not sandbox.GizmoFolder then return nil end
+			local ray = cursorRay()
+			local rp = RaycastParams.new()
+			rp.FilterType = Enum.RaycastFilterType.Include
+			rp.FilterDescendantsInstances = { sandbox.GizmoFolder }
+			local res = Workspace:Raycast(ray.Origin, ray.Direction * 3000, rp)
+			return res and res.Instance or nil
+		end
+
+		local function cursorGround(planeY)
+			local ray = cursorRay()
+			if sandbox.RespectTerrain then
+				local rp = RaycastParams.new()
+				rp.FilterType = Enum.RaycastFilterType.Exclude
+				local ignore = {}
+				if LocalPlayer.Character then table.insert(ignore, LocalPlayer.Character) end
+				if sandbox.Folder then table.insert(ignore, sandbox.Folder) end
+				if sandbox.GizmoFolder then table.insert(ignore, sandbox.GizmoFolder) end
+				if sandbox.DotsFolder then table.insert(ignore, sandbox.DotsFolder) end
+				rp.FilterDescendantsInstances = ignore
+				local res = Workspace:Raycast(ray.Origin, ray.Direction * 4000, rp)
+				return res and res.Position or nil
+			end
+			if not planeY then return nil end
+			local plane = Plane.new(Vector3.new(0, planeY, 0), Vector3.new(0, 1, 0))
+			local dist = ray:IntersectPlane(plane)
+			if dist then return ray.Origin + ray.Direction * dist end
+			return nil
+		end
+
+		local function project(v3)
+			local sp = Workspace.CurrentCamera:WorldToViewportPoint(v3)
+			return Vector2.new(sp.X, sp.Y)
+		end
+
+		-- ---------- spawn / add / delete / clone ----------
+		local function anchorAll(model)
+			for _, d in ipairs(model:GetDescendants()) do
+				if d:IsA("BasePart") then
+					d.Anchored = true
+					d.CanCollide = false
+					d.CanQuery = true
+					d.CanTouch = false
+				end
+			end
+		end
+
+		local function defaultSpawnPos()
+			local ch = LocalPlayer.Character
+			local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+			local base
+			if hrp then
+				base = hrp.Position + hrp.CFrame.LookVector * 14
+			else
+				base = getCenterPosition()
+			end
+			return groundSnap(base)
+		end
+
+		local function addItem(name)
 			local src = getStructureByName(name)
-			if not src then
-				vpCam.CFrame = CFrame.new(Vector3.new(7, 7, 7), Vector3.new(0, 1, -2.5)); return
+			if not src then showNotification("Structure not found: " .. name, 2); return nil end
+			local clone = src:Clone()
+			if not clone:IsA("Model") then
+				local holder = Instance.new("Model")
+				holder.Name = name
+				clone.Parent = holder
+				clone = holder
 			end
-			local vm = src:Clone(); vm.Parent = vpWorld
-			buildState.ViewportViewModel = vm
-			if vm:IsA("Model") then
-				local _, s = vm:GetBoundingBox(); buildState.VMSize = s
-			elseif vm:IsA("BasePart") then
-				buildState.VMSize = vm.Size
-			end
-			refreshViewport()
-			vpCam.CFrame = CFrame.new(Vector3.new(7, 7, 7), Vector3.new(0, 1, -2.5))
-		end
+			clone.Name = name
+			anchorAll(clone)
+			clone.Parent = ensureFolder()
 
-		sectionTitle(p, "Placement")
+			local _, size = clone:GetBoundingBox()
+			local pos = defaultSpawnPos()
+			clone:PivotTo(CFrame.new(pos + Vector3.new(0, size.Y / 2, 0)))
 
-		local axisRow = make("Frame", { Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1 }, p)
-		local axisButtons = {}
-		local holdUp, holdDown
-
-		local function axisLabel(sign) return "Hold " .. sign .. buildState.SelectedAxis .. " Offset" end
-
-		local function refreshAxisButtons()
-			for b, a in pairs(axisButtons) do
-				local on = (a == buildState.SelectedAxis)
-				b.BackgroundColor3 = on and T.Accent or T.PanelD
-				b.TextColor3 = on and T.Bg2 or T.Dim
-			end
-			if holdUp then holdUp.Text = axisLabel("+") end
-			if holdDown then holdDown.Text = axisLabel("-") end
-		end
-
-		for i, ax in ipairs({ "X", "Y", "Z" }) do
-			local b = make("TextButton", { Size = UDim2.new(0.31, 0, 1, 0), Position = UDim2.new((i - 1) * 0.345, 0, 0, 0),
-				BackgroundColor3 = T.PanelD, Font = Enum.Font.GothamBold, Text = "Axis " .. ax,
-				TextColor3 = T.Dim, TextSize = 10, ClipsDescendants = true }, axisRow)
-			corner(b, 7); stroke(b, T.Stroke, 0.5)
-			b.MouseButton1Down:Connect(function() ripple(b) end)
-			b.MouseButton1Click:Connect(function()
-				buildState.SelectedAxis = ax
-				refreshAxisButtons(); refreshViewport()
-				showNotification("Axis: " .. ax, 1.2)
+			local rec = { model = clone, name = name }
+			table.insert(sandbox.Items, rec)
+			pushHistory(function()
+				if rec.model then rec.model.Parent = nil end
+			end, function()
+				if rec.model then rec.model.Parent = ensureFolder() end
 			end)
-			axisButtons[b] = ax
+			return rec
 		end
 
-		local ctrl = make("Frame", { Size = UDim2.new(1, 0, 0, 84), BackgroundTransparency = 1, Visible = false }, p)
-		make("UIGridLayout", { CellSize = UDim2.new(0.48, 0, 0, 24), CellPadding = UDim2.new(0.04, 0, 0.08, 0) }, ctrl)
-
-		local function gridBtn(text)
-			local b = make("TextButton", { BackgroundColor3 = T.PanelD, Font = Enum.Font.GothamBold,
-				Text = text, TextColor3 = T.Text, TextSize = 9, ClipsDescendants = true }, ctrl)
-			corner(b, 7); stroke(b, T.Stroke, 0.5)
-			b.MouseButton1Down:Connect(function() ripple(b) end)
-			return b
+		local function removeRec(rec)
+			if not rec.model then return end
+			rec.model.Parent = nil
+			sandbox.Selected[rec] = nil
 		end
 
-		holdUp = gridBtn(axisLabel("+")); holdDown = gridBtn(axisLabel("-"))
-		local rotP = gridBtn("Rotate +"); local rotN = gridBtn("Rotate -")
-		local resetOff = gridBtn("Reset Offsets")
-
-		local function nudge(d)
-			local ax = buildState.SelectedAxis
-			buildState.AxisOffset[ax] = buildState.AxisOffset[ax] + d
-			refreshViewport()
+		local function deleteSelected()
+			local list = {}
+			for rec in pairs(sandbox.Selected) do table.insert(list, rec) end
+			if #list == 0 then showNotification("Select a structure first", 1.4); return end
+			sandbox.Selected = {}
+			for _, rec in ipairs(list) do removeRec(rec) end
+			pushHistory(function()
+				for _, rec in ipairs(list) do if rec.model then rec.model.Parent = ensureFolder() end end
+			end, function()
+				for _, rec in ipairs(list) do if rec.model then rec.model.Parent = nil end end
+			end)
+			refreshGizmo(); clearDots()
+			showNotification("Deleted " .. #list .. " structure(s)", 1.3)
 		end
-		local holdAction
-		local function startHold(fn) holdAction = fn; task.spawn(function() while holdAction == fn do fn(); task.wait(0.03) end end) end
-		local function stopHold() holdAction = nil end
 
-		holdUp.MouseButton1Down:Connect(function() startHold(function() nudge(0.15) end) end)
-		holdUp.MouseButton1Up:Connect(stopHold); holdUp.MouseLeave:Connect(stopHold)
-		holdDown.MouseButton1Down:Connect(function() startHold(function() nudge(-0.15) end) end)
-		holdDown.MouseButton1Up:Connect(stopHold); holdDown.MouseLeave:Connect(stopHold)
-
-		local function rotDelta(d)
-			local r = buildState.Rotation
-			if buildState.SelectedAxis == "X" then buildState.Rotation = Vector3.new((r.X + d) % 360, r.Y, r.Z)
-			elseif buildState.SelectedAxis == "Y" then buildState.Rotation = Vector3.new(r.X, (r.Y + d) % 360, r.Z)
-			else buildState.Rotation = Vector3.new(r.X, r.Y, (r.Z + d) % 360) end
-			refreshViewport()
+		local function cloneSelected()
+			local list = {}
+			for rec in pairs(sandbox.Selected) do table.insert(list, rec) end
+			if #list == 0 then showNotification("Select a structure first", 1.4); return end
+			local created = {}
+			for _, rec in ipairs(list) do
+				if rec.model and rec.model.Parent then
+					local clone = rec.model:Clone()
+					anchorAll(clone)
+					clone.Parent = ensureFolder()
+					clone:PivotTo(rec.model:GetPivot() + Vector3.new(3, 0, 0))
+					local nrec = { model = clone, name = rec.name }
+					table.insert(sandbox.Items, nrec)
+					table.insert(created, nrec)
+				end
+			end
+			pushHistory(function()
+				for _, nrec in ipairs(created) do if nrec.model then nrec.model.Parent = nil end end
+			end, function()
+				for _, nrec in ipairs(created) do if nrec.model then nrec.model.Parent = ensureFolder() end end
+			end)
+			clearSelection()
+			for _, nrec in ipairs(created) do selectRec(nrec, true) end
+			showNotification("Cloned " .. #created .. " structure(s)", 1.3)
 		end
-		rotP.MouseButton1Down:Connect(function() startHold(function() rotDelta(3) end) end)
-		rotP.MouseButton1Up:Connect(stopHold); rotP.MouseLeave:Connect(stopHold)
-		rotN.MouseButton1Down:Connect(function() startHold(function() rotDelta(-3) end) end)
-		rotN.MouseButton1Up:Connect(stopHold); rotN.MouseLeave:Connect(stopHold)
 
-		resetOff.MouseButton1Click:Connect(function()
-			buildState.AxisOffset = { X = 0, Y = 0, Z = 0 }
-			refreshViewport()
-			showNotification("All axis offsets reset", 1.4)
+		local function rotateSelectedBy(deg)
+			local list = {}
+			for rec in pairs(sandbox.Selected) do table.insert(list, rec) end
+			if #list == 0 then showNotification("Select a structure first", 1.4); return end
+			local center = selectionCenter()
+			if not center then return end
+			local old = {}
+			for _, rec in ipairs(list) do old[rec] = pivotOf(rec) end
+			local rot = CFrame.new(center) * CFrame.Angles(0, math.rad(deg), 0) * CFrame.new(-center)
+			for _, rec in ipairs(list) do rec.model:PivotTo(rot * old[rec]) end
+			pushHistory(function()
+				for _, rec in ipairs(list) do if rec.model then rec.model:PivotTo(old[rec]) end end
+			end, function()
+				for _, rec in ipairs(list) do if rec.model then rec.model:PivotTo(rot * old[rec]) end end
+			end)
+			showNotification("Rotated " .. deg .. "°", 1.1)
+		end
+
+		-- ---------- dragging ----------
+		local function beginDrag(mode, axis, fromGizmo)
+			local center = selectionCenter()
+			if not center then return end
+			local starts = {}
+			for rec in pairs(sandbox.Selected) do
+				if rec.model and rec.model.Parent then
+					table.insert(starts, { rec = rec, pivot = pivotOf(rec) })
+				end
+			end
+			if #starts == 0 then return end
+			sandbox.Drag = {
+				mode = mode,
+				axis = axis,
+				fromGizmo = fromGizmo,
+				center = center,
+				starts = starts,
+				startMouse = UserInputService:GetMouseLocation(),
+				startGround = cursorGround(center.Y),
+			}
+		end
+
+		local function applyDrag()
+			local d = sandbox.Drag
+			if not d then return end
+			local mp = UserInputService:GetMouseLocation()
+			local delta = mp - d.startMouse
+
+			if d.mode == "move" then
+				if d.fromGizmo and d.axis then
+					local dir = Vector3.new(d.axis == "X" and 1 or 0, d.axis == "Y" and 1 or 0, d.axis == "Z" and 1 or 0)
+					local a2, b2 = project(d.center), project(d.center + dir * 4)
+					local screenDir = b2 - a2
+					local amount = 0
+					if screenDir.Magnitude > 0.0001 then
+						amount = delta:Dot(screenDir.Unit) * 0.045
+					end
+					amount = snap(amount, sandbox.MoveIncrement)
+					local shift = dir * amount
+					for _, s in ipairs(d.starts) do s.rec.model:PivotTo(CFrame.new(shift) * s.pivot) end
+				else
+					local now = cursorGround(d.center.Y)
+					if now and d.startGround then
+						local diff = now - d.startGround
+						if not sandbox.RespectTerrain then diff = Vector3.new(diff.X, 0, diff.Z) end
+						diff = Vector3.new(snap(diff.X, sandbox.MoveIncrement), snap(diff.Y, sandbox.MoveIncrement), snap(diff.Z, sandbox.MoveIncrement))
+						for _, s in ipairs(d.starts) do s.rec.model:PivotTo(CFrame.new(diff) * s.pivot) end
+					end
+				end
+			elseif d.mode == "rotate" then
+				local amount = snap(delta.X * 0.55, sandbox.RotateIncrement)
+				local rot = CFrame.new(d.center) * CFrame.Angles(0, math.rad(amount), 0) * CFrame.new(-d.center)
+				for _, s in ipairs(d.starts) do s.rec.model:PivotTo(rot * s.pivot) end
+			end
+		end
+
+		local function endDrag()
+			local d = sandbox.Drag
+			if not d then return end
+			sandbox.Drag = nil
+			local olds, news = {}, {}
+			for _, s in ipairs(d.starts) do
+				olds[s.rec] = s.pivot
+				news[s.rec] = pivotOf(s.rec)
+			end
+			pushHistory(function()
+				for rec, cf in pairs(olds) do if rec.model then rec.model:PivotTo(cf) end end
+			end, function()
+				for rec, cf in pairs(news) do if rec.model then rec.model:PivotTo(cf) end end
+			end)
+		end
+
+		-- ---------- tool inventory ----------
+		local INVENTORY_TOOLS = {
+			{ name = "undo",   icon = "rbxassetid://90410550367647", label = "Undo",   key = "1" },
+			{ name = "redo",   icon = "rbxassetid://133663962581285", label = "Redo",  key = "2" },
+			{ name = "move",   icon = "rbxassetid://132159706410213", label = "Move",  key = "3" },
+			{ name = "copy",   icon = "rbxassetid://91403080584860",  label = "Clone", key = "4" },
+			{ name = "rotate", icon = "rbxassetid://92528573566202",  label = "Rotate", key = "5" },
+			{ name = "delete", icon = "rbxassetid://11768918600",     label = "Delete", key = "6" },
+			{ name = "camera", icon = "rbxassetid://16060788318",     label = "Camera", key = "7" },
+		}
+		local toolButtons = {}
+
+		local function refreshToolVisuals()
+			for name, b in pairs(toolButtons) do
+				local on = sandbox.Tool == name
+				TweenService:Create(b, TweenInfo.new(0.16), {
+					BackgroundColor3 = on and T.Accent or T.Panel,
+					BackgroundTransparency = on and 0 or 0.15,
+				}):Play()
+				local img = b:FindFirstChild("Icon")
+				if img then
+					TweenService:Create(img, TweenInfo.new(0.16), {
+						ImageColor3 = on and Color3.new(1, 1, 1) or Color3.fromRGB(205, 215, 240),
+					}):Play()
+				end
+			end
+		end
+
+		local function destroyInventory()
+			if sandbox.UI then sandbox.UI:Destroy(); sandbox.UI = nil end
+			toolButtons = {}
+		end
+
+		local selectTool
+
+		local function buildInventory()
+			destroyInventory()
+			local sg = make("ScreenGui", { Name = "LunarSandboxTools", ResetOnSpawn = false,
+				IgnoreGuiInset = true, DisplayOrder = 40, ZIndexBehavior = Enum.ZIndexBehavior.Sibling }, UI_PARENT)
+			sandbox.UI = sg
+
+			local bar = make("Frame", { Size = UDim2.new(0, #INVENTORY_TOOLS * 52 + 16, 0, 64),
+				AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -16),
+				BackgroundColor3 = T.Bg2, BorderSizePixel = 0, ZIndex = 2 }, sg)
+			corner(bar, 14); stroke(bar, T.Accent, 0.2, 1.5)
+			themeGradient(bar, "Bg1", "Bg2", 90)
+			make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6),
+				HorizontalAlignment = Enum.HorizontalAlignment.Center, VerticalAlignment = Enum.VerticalAlignment.Center }, bar)
+
+			for idx, t in ipairs(INVENTORY_TOOLS) do
+				local b = make("TextButton", { Name = t.name, Size = UDim2.new(0, 44, 0, 44),
+					BackgroundColor3 = T.Panel, BackgroundTransparency = 0.15, Text = "",
+					AutoButtonColor = false, ZIndex = 3, ClipsDescendants = true }, bar)
+				corner(b, 10); local s = stroke(b, T.Stroke, 0.45)
+				local img = make("ImageLabel", { Name = "Icon", Size = UDim2.new(0, 30, 0, 30),
+					AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+					BackgroundTransparency = 1, Image = t.icon, ImageColor3 = Color3.fromRGB(205, 215, 240),
+					ZIndex = 4 }, b)
+				make("TextLabel", { Size = UDim2.new(0, 14, 0, 12), Position = UDim2.new(0, 3, 0, 2),
+					BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = t.key,
+					TextColor3 = T.Dim, TextSize = 9, ZIndex = 5 }, b)
+				hover(b, T.Panel, T.Hover, s)
+				b.MouseButton1Down:Connect(function() ripple(b) end)
+				b.MouseButton1Click:Connect(function() playClick(); selectTool(t.name) end)
+				toolButtons[t.name] = b
+			end
+			refreshToolVisuals()
+		end
+
+		-- ---------- freecam ----------
+		local fc = sandbox.Freecam
+		fc.Pitch = 0
+		fc.Yaw = 0
+		fc.TargetFOV = 70
+		local fcGui = nil
+		local fcZoomIn, fcZoomOut
+
+		local function buildFreecamButtons()
+			if fcGui then fcGui:Destroy() end
+			fcGui = make("ScreenGui", { Name = "LunarFreecam", ResetOnSpawn = false,
+				IgnoreGuiInset = true, DisplayOrder = 42 }, UI_PARENT)
+			local function mk(label, x)
+				local b = make("TextButton", { Size = UDim2.new(0, 52, 0, 52), Position = UDim2.new(1, x, 1, -200),
+					BackgroundColor3 = T.Bg2, BackgroundTransparency = 0.1, Font = Enum.Font.GothamBold,
+					Text = label, TextColor3 = T.Text, TextSize = 20, AutoButtonColor = false, ZIndex = 2 }, fcGui)
+				corner(b, 14); stroke(b, T.Accent, 0.3, 1.5)
+				b.Draggable = true
+				return b
+			end
+			fcZoomIn = mk("+", -68)
+			fcZoomOut = mk("-", -132)
+		end
+
+		local function exitFreecam()
+			if not fc.Active then return end
+			fc.Active = false
+			local cam = Workspace.CurrentCamera
+			if fc.Saved then
+				cam.CameraType = fc.Saved.Type
+				cam.CFrame = fc.Saved.CFrame
+				cam.FieldOfView = fc.Saved.FOV or 70
+			end
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+			UserInputService.MouseIconEnabled = true
+			if fcGui then fcGui:Destroy(); fcGui = nil end
+			refreshGizmo()
+			showNotification("Freecam off", 1.3)
+		end
+
+		local function enterFreecam()
+			if fc.Active then return end
+			local cam = Workspace.CurrentCamera
+			local cf = cam.CFrame
+			local px, yaw = cf:ToEulerAnglesYXZ()
+			fc.Active = true
+			fc.Saved = { CFrame = cf, Type = cam.CameraType, FOV = cam.FieldOfView }
+			fc.Pitch = px
+			fc.Yaw = yaw
+			fc.TargetFOV = cam.FieldOfView
+			cam.CameraType = Enum.CameraType.Scriptable
+			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+			UserInputService.MouseIconEnabled = false
+			clearGizmo(); clearDots()
+			if IS_MOBILE then buildFreecamButtons() end
+			showNotification("Freecam — " .. (IS_MOBILE and "stick to move, drag to look, +/- to zoom" or "WASD to move, Q/E zoom"), 3)
+		end
+
+		UserInputService.InputChanged:Connect(function(i, gp)
+			if not fc.Active then return end
+			if i.UserInputType == Enum.UserInputType.MouseMovement and not IS_MOBILE then
+				fc.Yaw -= i.Delta.X * 0.0028
+				fc.Pitch = math.clamp(fc.Pitch - i.Delta.Y * 0.0028, -math.rad(88), math.rad(88))
+			elseif i.UserInputType == Enum.UserInputType.Touch and not gp then
+				fc.Yaw -= i.Delta.X * 0.006
+				fc.Pitch = math.clamp(fc.Pitch - i.Delta.Y * 0.006, -math.rad(88), math.rad(88))
+			end
 		end)
 
-		local worldArrows = {}
-		local function updateBox()
-			if not buildState.BoundingBoxPart then return end
-			local ch = LocalPlayer.Character
-			local hrp = ch and ch:FindFirstChild("HumanoidRootPart"); if not hrp then return end
-			local cf = hrp.CFrame * baseCFrame()
-			buildState.BoundingBoxPart.CFrame = cf
-			updateAxisArrows(worldArrows, cf, buildState.BoundingBoxPart.Size, 0.4)
-		end
+		RunService.RenderStepped:Connect(function(dt)
+			if not fc.Active then return end
+			local cam = Workspace.CurrentCamera
+			cam.CameraType = Enum.CameraType.Scriptable
 
-		local function cancelBuild()
-			if buildState.BoundingBoxPart then buildState.BoundingBoxPart:Destroy(); buildState.BoundingBoxPart = nil end
-			if buildState.RenderConnection then buildState.RenderConnection:Disconnect(); buildState.RenderConnection = nil end
-			clearAxisArrows(worldArrows); worldArrows = {}
-			buildState.IsConstructing = false
-			vp.Visible = false; ctrl.Visible = false
-			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-			UserInputService.MouseIconEnabled = true
-		end
-		uiRefs.cancelBuild = cancelBuild
-
-		local function startBuild()
-			local nm = buildState.StructureName
-			if not nm or nm == "" then showNotification("Enter a structure name!", 1.6); return end
-			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-			UserInputService.MouseIconEnabled = true
-			Workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
-
-			local src = getStructureByName(nm)
-			local size = Vector3.new(4, 4, 4)
-			if src then
-				if src:IsA("Model") then local _, s = src:GetBoundingBox(); size = s
-				elseif src:IsA("BasePart") then size = src.Size end
+			local move = Vector3.zero
+			if not IS_MOBILE then
+				if UserInputService:IsKeyDown(Enum.KeyCode.W) then move += Vector3.new(0, 0, -1) end
+				if UserInputService:IsKeyDown(Enum.KeyCode.S) then move += Vector3.new(0, 0, 1) end
+				if UserInputService:IsKeyDown(Enum.KeyCode.A) then move += Vector3.new(-1, 0, 0) end
+				if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += Vector3.new(1, 0, 0) end
+				if UserInputService:IsKeyDown(Enum.KeyCode.Q) then fc.TargetFOV -= 45 * dt end
+				if UserInputService:IsKeyDown(Enum.KeyCode.E) then fc.TargetFOV += 45 * dt end
+			else
+				local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+				local md = hum and hum.MoveDirection or Vector3.zero
+				if md.Magnitude > 0.05 then
+					local flat = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
+					if flat.Magnitude < 0.01 then flat = Vector3.new(0, 0, -1) end
+					flat = flat.Unit
+					local right = Vector3.new(flat.Z, 0, -flat.X)
+					move = flat * (-md.Z) + right * md.X
+				end
+				if fcZoomIn and fcZoomIn:IsPressed() then fc.TargetFOV -= 45 * dt end
+				if fcZoomOut and fcZoomOut:IsPressed() then fc.TargetFOV += 45 * dt end
 			end
-			if buildState.BoundingBoxPart then buildState.BoundingBoxPart:Destroy() end
-			local box = make("Part", { Name = "StructurePlacementBox", Size = size, Color = T.Good,
-				Material = Enum.Material.SmoothPlastic, Transparency = 0.55, CanCollide = false, CanQuery = false,
-				CanTouch = false, CastShadow = false, Massless = true, Anchored = true }, Workspace)
-			buildState.BoundingBoxPart = box
-			buildState.IsConstructing = true
-			worldArrows = createAxisArrows(Workspace, 4)
-			setupViewport(nm)
-			vp.Visible = true; ctrl.Visible = true
-			if buildState.RenderConnection then buildState.RenderConnection:Disconnect() end
-			buildState.RenderConnection = RunService.RenderStepped:Connect(updateBox)
-			showNotification("Constructing: " .. nm, 1.5)
+
+			fc.TargetFOV = math.clamp(fc.TargetFOV, 8, 100)
+			cam.FieldOfView += (fc.TargetFOV - cam.FieldOfView) * math.min(dt * 8, 1)
+
+			local speed = 55
+			if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then speed = 160 end
+			if move.Magnitude > 0.01 then
+				cam.CFrame = cam.CFrame + move.Unit * speed * dt
+			end
+			cam.CFrame = CFrame.new(cam.CFrame.Position) * CFrame.fromEulerAnglesYXZ(fc.Pitch, fc.Yaw, 0)
+		end)
+
+		-- ---------- tool selection ----------
+		local function clearTool()
+			sandbox.Tool = nil
+			refreshToolVisuals()
+			clearGizmo()
+			clearDots()
+			if fc.Active then exitFreecam() end
 		end
 
-		local function placeBuild()
-			local ch = LocalPlayer.Character
-			local hrp = ch and ch:FindFirstChild("HumanoidRootPart"); if not hrp then return end
-			local cf = hrp.CFrame * baseCFrame()
-			if BuildPlaceRemote then
-				BuildPlaceRemote:FireServer(cf.Position, buildState.StructureName, buildState.Rotation.Y)
-				showNotification("Placed " .. buildState.StructureName, 1.4)
+		selectTool = function(name)
+			if name == "undo" then doUndo(); refreshToolVisuals(); return end
+			if name == "redo" then doRedo(); refreshToolVisuals(); return end
+			if name == "camera" then
+				if fc.Active then
+					exitFreecam()
+					sandbox.Tool = nil
+					refreshToolVisuals()
+					return
+				end
+				sandbox.Tool = "camera"
+				refreshToolVisuals()
+				showNotification("Camera tool — click to enter freecam", 1.6)
+				return
 			end
-			cancelBuild()
+			if sandbox.Tool == name then clearTool(); return end
+			sandbox.Tool = name
+			refreshToolVisuals()
+			refreshGizmo()
+			showNotification(name:upper() .. " tool", 1.1)
 		end
+
+		-- ---------- world input ----------
+		UserInputService.InputBegan:Connect(function(i, gp)
+			if gp then return end
+			if not sandbox.Active then return end
+			if fc.Active then return end
+			if i.UserInputType ~= Enum.UserInputType.MouseButton1 and i.UserInputType ~= Enum.UserInputType.Touch then return end
+			if overUi() then return end
+
+			local additive = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+
+			local giz = pickGizmo()
+			if giz then
+				local axis = giz:GetAttribute("axis")
+				if giz.Name == "GizmoRot" or giz.Name:find("GizmoRot") then
+					beginDrag("rotate", "Y", true)
+				elseif axis then
+					beginDrag("move", axis, true)
+				end
+				return
+			end
+
+			if sandbox.Tool == "camera" then
+				enterFreecam()
+				return
+			end
+
+			local rec = pickRec()
+			if not rec then
+				if not additive then clearSelection() end
+				return
+			end
+
+			if sandbox.Tool == "delete" then
+				selectRec(rec, false)
+				deleteSelected()
+				return
+			elseif sandbox.Tool == "copy" then
+				selectRec(rec, false)
+				cloneSelected()
+				return
+			elseif sandbox.Tool == "move" then
+				if not sandbox.Selected[rec] then selectRec(rec, additive) end
+				beginDrag("move", nil, false)
+				return
+			elseif sandbox.Tool == "rotate" then
+				if not sandbox.Selected[rec] then selectRec(rec, additive) end
+				beginDrag("rotate", "Y", false)
+				return
+			else
+				if sandbox.Selected[rec] and additive then
+					sandbox.Selected[rec] = nil
+					local h = rec.model:FindFirstChild("LunarSel")
+					if h then h:Destroy() end
+					refreshGizmo()
+				else
+					selectRec(rec, additive)
+				end
+			end
+		end)
+
+		UserInputService.InputChanged:Connect(function(i)
+			if sandbox.Drag and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+				applyDrag()
+			end
+		end)
+
+		UserInputService.InputEnded:Connect(function(i)
+			if sandbox.Drag and (i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch) then
+				endDrag()
+			end
+		end)
+
+		RunService.RenderStepped:Connect(function()
+			if not sandbox.Active then return end
+			if fc.Active then return end
+			updateGizmo()
+			local center = selectionCenter()
+			if center then
+				local target = cursorGround(center.Y)
+				if target then
+					updateDots(center, target, (tick() * 0.45) % 1)
+				else
+					clearDots()
+				end
+			else
+				clearDots()
+			end
+		end)
+
+		-- ---------- construct / build / cancel ----------
+		local constructBtn, buildBtn, cancelBtn
+
+		local function refreshModeButtons()
+			if sandbox.Active then
+				constructBtn.Text = "Add"
+				constructBtn.BackgroundColor3 = Color3.fromRGB(120, 90, 40)
+			else
+				constructBtn.Text = "Construct"
+				constructBtn.BackgroundColor3 = Color3.fromRGB(38, 166, 91)
+			end
+		end
+
+		local function confirm(title, onYes)
+			local old = gui:FindFirstChild("SandboxConfirm"); if old then old:Destroy() end
+			local f = make("Frame", { Name = "SandboxConfirm", Size = UDim2.new(0, 300, 0, 0),
+				Position = UDim2.new(0.5, -150, 0.5, -40), BackgroundColor3 = T.Bg1,
+				BorderSizePixel = 0, ZIndex = 90, ClipsDescendants = true }, gui)
+			corner(f, 10); stroke(f, T.Accent, 0.2, 1.5)
+			TweenService:Create(f, TweenInfo.new(0.26, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+				{ Size = UDim2.new(0, 300, 0, 88) }):Play()
+			make("TextLabel", { Size = UDim2.new(1, -20, 0, 34), Position = UDim2.new(0, 14, 0, 8), BackgroundTransparency = 1,
+				Font = Enum.Font.GothamBold, Text = title, TextColor3 = T.Text, TextSize = 13,
+				TextXAlignment = Enum.TextXAlignment.Left }, f)
+			local br = make("Frame", { Size = UDim2.new(1, -24, 0, 30), Position = UDim2.new(0, 12, 0, 46), BackgroundTransparency = 1 }, f)
+			local function mk(text, x, col, fn)
+				local b = make("TextButton", { Size = UDim2.new(0.48, 0, 1, 0), Position = UDim2.new(x, 0, 0, 0),
+					BackgroundColor3 = col, Font = Enum.Font.GothamBold, Text = text, TextColor3 = T.Text,
+					TextSize = 11, AutoButtonColor = false, ClipsDescendants = true }, br)
+				corner(b, 8); local s = stroke(b, T.Stroke, 0.4); hover(b, col, T.Hover, s)
+				b.MouseButton1Down:Connect(function() ripple(b) end)
+				b.MouseButton1Click:Connect(function() playClick(); f:Destroy(); if fn then fn() end end)
+			end
+			mk("Yes", 0, Color3.fromRGB(38, 130, 75), onYes)
+			mk("No", 0.52, Color3.fromRGB(150, 55, 55), nil)
+		end
+
+		local function stopConstruct(clear)
+			if fc.Active then exitFreecam() end
+			clearSelection()
+			clearGizmo()
+			clearDots()
+			if clear and sandbox.Folder then
+				for _, rec in ipairs(sandbox.Items) do
+					if rec.model then rec.model:Destroy() end
+				end
+			end
+			sandbox.Items = {}
+			sandbox.History = {}
+			sandbox.RedoStack = {}
+			sandbox.Selected = {}
+			sandbox.Tool = nil
+			sandbox.Drag = nil
+			sandbox.Active = false
+			destroyInventory()
+			refreshModeButtons()
+		end
+
+		local function doBuild()
+			local live = {}
+			for _, rec in ipairs(sandbox.Items) do
+				if rec.model and rec.model.Parent then table.insert(live, rec) end
+			end
+			if #live == 0 then showNotification("Nothing to build", 1.5); return end
+			if not BuildPlaceRemote then showNotification("BuildPlace remote missing", 2); return end
+			showNotification("Building " .. #live .. " structure(s)...", 1.6)
+			task.spawn(function()
+				local n = 0
+				for _, rec in ipairs(live) do
+					if rec.model and rec.model.Parent then
+						local pivot = rec.model:GetPivot()
+						local _, size = rec.model:GetBoundingBox()
+						local _, yRot = pivot:ToEulerAnglesYXZ()
+						local pos = pivot.Position - Vector3.new(0, size.Y / 2, 0)
+						BuildPlaceRemote:FireServer(pos, rec.name, math.deg(yRot))
+						n += 1
+						if n % 5 == 0 then RunService.Heartbeat:Wait() end
+					end
+				end
+				showNotification("Built " .. n .. " structure(s)", 1.8)
+				stopConstruct(true)
+			end)
+		end
+
+		-- ---------- page widgets ----------
+		sectionTitle(p, "Structure")
+
+		local nameBox = createTextBox(p, "Structure Name", "type a structure name", sandbox.BuildName, function(v)
+			if v ~= "" then
+				sandbox.BuildName = v
+				buildState.StructureName = v
+			end
+		end, "Model name that will be spawned in the sandbox")
+
+		local function structureEntries()
+			local out, seen = {}, {}
+			local function scan(inst, depth)
+				if depth > 7 then return end
+				for _, c in ipairs(inst:GetChildren()) do
+					if c:IsA("Model") then
+						if not seen[c.Name] then
+							seen[c.Name] = true
+							table.insert(out, { text = c.Name, value = c.Name })
+						end
+						scan(c, depth + 1)
+					elseif c:IsA("Folder") then
+						scan(c, depth + 1)
+					end
+				end
+			end
+			local assets = ReplicatedStorage:FindFirstChild("Assets")
+			if assets then scan(assets, 0) end
+			table.sort(out, function(a, b) return a.text < b.text end)
+			if #out == 0 then table.insert(out, { text = "no structures found", value = "none" }) end
+			return out
+		end
+
+		local nameDrop
+		nameDrop = createDropdown(p, "Pick Structure", structureEntries(), function(e)
+			if e.value == "none" then return end
+			sandbox.BuildName = e.value
+			buildState.StructureName = e.value
+			nameBox.Text = e.value
+			showNotification("Structure: " .. e.value, 1.4)
+		end, { tip = "Big list of every model available to build", maxHeight = 260,
+			onToggle = function(open) if open then nameDrop.setEntries(structureEntries()) end end })
 
 		local actRow = make("Frame", { Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1 }, p)
-		local function actBtn(text, x, col, fn, tip)
+		local function actBtn(text, x, col, tip)
 			local b = make("TextButton", { Size = UDim2.new(0.31, 0, 1, 0), Position = UDim2.new(x, 0, 0, 0),
 				BackgroundColor3 = col, Font = Enum.Font.GothamBold, Text = text, TextColor3 = T.Text,
 				TextSize = 10, ClipsDescendants = true }, actRow)
 			corner(b, 7); local s = stroke(b, T.Stroke, 0.4); hover(b, col, T.Hover, s)
 			if tip then addTooltip(b, tip) end
 			b.MouseButton1Down:Connect(function() ripple(b) end)
-			b.MouseButton1Click:Connect(function() fn() end)
+			return b
 		end
-		actBtn("Construct", 0, Color3.fromRGB(38, 166, 91), startBuild, "Show the placement preview")
-		actBtn("Build", 0.345, Color3.fromRGB(41, 128, 185), placeBuild, "Place the structure")
-		actBtn("Cancel", 0.69, Color3.fromRGB(192, 57, 43), cancelBuild, "Hide the preview")
+
+		constructBtn = actBtn("Construct", 0, Color3.fromRGB(38, 166, 91), "Spawn a structure to work on (becomes Add while active)")
+		buildBtn = actBtn("Build", 0.345, Color3.fromRGB(41, 128, 185), "Place everything in the sandbox")
+		cancelBtn = actBtn("Cancel", 0.69, Color3.fromRGB(192, 57, 43), "Discard the sandbox")
+
+		constructBtn.MouseButton1Click:Connect(function()
+			playClick()
+			if sandbox.Active then
+				local rec = addItem(sandbox.BuildName)
+				if rec then showNotification("Added " .. sandbox.BuildName, 1.3) end
+			else
+				if not sandbox.BuildName or sandbox.BuildName == "" then
+					showNotification("Pick or type a structure first", 1.8); return
+				end
+				if not getStructureByName(sandbox.BuildName) then
+					showNotification("Structure not found: " .. sandbox.BuildName, 2); return
+				end
+				sandbox.Active = true
+				refreshModeButtons()
+				buildInventory()
+				addItem(sandbox.BuildName)
+				showNotification("Construction mode — 1-7 picks a tool", 2)
+			end
+		end)
+
+		buildBtn.MouseButton1Click:Connect(function()
+			playClick()
+			if not sandbox.Active then showNotification("Nothing in the sandbox", 1.5); return end
+			confirm("Are you sure?", doBuild)
+		end)
+
+		cancelBtn.MouseButton1Click:Connect(function()
+			playClick()
+			if not sandbox.Active then return end
+			confirm("Are you sure?", function()
+				stopConstruct(true)
+				showNotification("Sandbox cleared", 1.4)
+			end)
+		end)
+
+		sectionTitle(p, "Construct Settings")
+		local _, cfgBody = createExpandPanel(p, "Sandbox Settings", "Increments, terrain snap and hints")
+
+		createSlider(cfgBody, "Move Increment", 0.1, 20, sandbox.MoveIncrement, 0.1, function(v)
+			sandbox.MoveIncrement = v
+		end, "Studs moved per snap step (gizmo and drag)")
+		createSlider(cfgBody, "Rotate Increment", 1, 90, sandbox.RotateIncrement, 1, function(v)
+			sandbox.RotateIncrement = v
+		end, "Degrees per snap step while rotating")
+		createToggle(cfgBody, "Respect Terrain", sandbox.RespectTerrain, function(v)
+			sandbox.RespectTerrain = v
+			showNotification(v and "Drag follows terrain" or "Drag stays level", 1.4)
+		end, "Drag keeps the structure on the ground surface", false)
+
+		make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
+			Text = "1-7 tools  •  Shift = multi select  •  Ctrl+C clone  •  Ctrl+X delete  •  Ctrl+Z undo  •  Ctrl+S redo  •  Ctrl+D rotate 90",
+			TextColor3 = T.Dim, TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left }, cfgBody)
+
+		-- expose to the global keybind listener
+		sandbox.Actions.undo = doUndo
+		sandbox.Actions.redo = doRedo
+		sandbox.Actions.clone = cloneSelected
+		sandbox.Actions.delete = deleteSelected
+		sandbox.Actions.rotate90 = function() rotateSelectedBy(90) end
+		sandbox.Actions.selectTool = selectTool
+		sandbox.Actions.stop = function() stopConstruct(true) end
 
 		sectionTitle(p, "Concurrent Build")
 
@@ -3548,7 +4387,7 @@ createMasterUI = function()
 		end
 
 		UserInputService.InputBegan:Connect(function(i, gp)
-			if gp or not concurrent.Active then return end
+			if gp or not concurrent.Active or sandbox.Active then return end
 			if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
 				local pos = getClickPosition()
 				concurrent.Holding = true
@@ -3610,6 +4449,9 @@ createMasterUI = function()
 				end
 			end
 		end)
+
+		uiRefs.cancelBuild = function() stopConstruct(true) end
+		refreshModeButtons()
 	end
 
 	------------------------------------------------
@@ -3830,6 +4672,7 @@ createMasterUI = function()
 		make("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, statsEditor)
 
 		local statsSnapshots = {}
+		local statsGlobalSnapshot = nil
 
 		local function copyValue(v)
 			if type(v) == "table" then
@@ -3846,6 +4689,14 @@ createMasterUI = function()
 				return c
 			end
 			return v
+		end
+
+		local function takeGlobalSnapshot()
+			if statsGlobalSnapshot then return end
+			statsGlobalSnapshot = {}
+			for name, data in pairs(ItemStats) do
+				if type(data) == "table" then statsGlobalSnapshot[name] = copyValue(data) end
+			end
 		end
 
 		local function serializeValue(v)
@@ -3938,6 +4789,7 @@ createMasterUI = function()
 		end
 
 		buildStatsEditor = function(name)
+			takeGlobalSnapshot()
 			statsEditor:ClearAllChildren()
 			make("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, statsEditor)
 			local data = ItemStats[name]
@@ -3991,6 +4843,36 @@ createMasterUI = function()
 			buildStatsEditor(e.value)
 		end, { tip = "Pick an item, then edit any of its keys below" })
 		statsDrop.setEntries(itemStatsEntries())
+
+		local statsRow = make("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, p)
+		local statsSave = createButton(statsRow, "Save Item Stats", Color3.fromRGB(38, 110, 60),
+			"Write every current item stat value to disk")
+		statsSave.Size = UDim2.new(0.62, 0, 1, 0)
+		statsSave.MouseButton1Click:Connect(function()
+			if saveItemStatsToDisk() then
+				takeGlobalSnapshot()
+				statsGlobalSnapshot = nil
+				takeGlobalSnapshot()
+				showNotification("Item stats saved to disk", 1.8)
+			end
+		end)
+		local statsCancel = createButton(statsRow, "Cancel", Color3.fromRGB(140, 50, 60),
+			"Restore every item stat to before you started editing")
+		statsCancel.Size = UDim2.new(0.35, 0, 1, 0)
+		statsCancel.Position = UDim2.new(0.65, 0, 0, 0)
+		statsCancel.MouseButton1Click:Connect(function()
+			if not statsGlobalSnapshot then showNotification("Nothing to revert", 1.4); return end
+			for name, snap in pairs(statsGlobalSnapshot) do
+				local data = ItemStats[name]
+				if type(data) == "table" then
+					for k, v in pairs(snap) do setStat(data, k, copyValue(v)) end
+				end
+			end
+			statsSnapshots = {}
+			statsEditor:ClearAllChildren()
+			make("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, statsEditor)
+			showNotification("Item stats reverted", 1.6)
+		end)
 
 		------------------------------------------------
 		-- MOBILE BUTTONS
@@ -4258,7 +5140,6 @@ createMasterUI = function()
 			TweenService:Create(glow, ti, { Size = targetSize, Position = targetPos }):Play()
 			tw:Play()
 			tw.Completed:Connect(function()
-				-- park the real window exactly where it was, then hide it
 				main.Visible = false
 				glow.Visible = false
 				main.Size = normalSize
@@ -4447,6 +5328,25 @@ UserInputService.InputBegan:Connect(function(input, gp)
 	end
 
 	if UserInputService:GetFocusedTextBox() then return end
+
+	-- sandbox hotkeys
+	if sandbox.Active and sandbox.Actions then
+		local ctrl = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+		if ctrl then
+			if input.KeyCode == Enum.KeyCode.C then if sandbox.Actions.clone then sandbox.Actions.clone() end; return end
+			if input.KeyCode == Enum.KeyCode.X then if sandbox.Actions.delete then sandbox.Actions.delete() end; return end
+			if input.KeyCode == Enum.KeyCode.Z then if sandbox.Actions.undo then sandbox.Actions.undo() end; return end
+			if input.KeyCode == Enum.KeyCode.S then if sandbox.Actions.redo then sandbox.Actions.redo() end; return end
+			if input.KeyCode == Enum.KeyCode.D then if sandbox.Actions.rotate90 then sandbox.Actions.rotate90() end; return end
+		end
+		local idx = ({ Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four,
+			Enum.KeyCode.Five, Enum.KeyCode.Six, Enum.KeyCode.Seven })[input.KeyCode.Value]
+		if idx then
+			local names = { "undo", "redo", "move", "copy", "rotate", "delete", "camera" }
+			if sandbox.Actions.selectTool then sandbox.Actions.selectTool(names[idx]) end
+			return
+		end
+	end
 
 	if uiRefs.gui and uiRefs.gui.Parent and not uiRefs.minimized and uiRefs.goToPage then
 		local names = { "General", "Item", "Builder", "Miscellaneous", "Settings" }
