@@ -1,15 +1,16 @@
 --[[
-	LUNAR MENU — v2.4.0
-	+ Item Stats: Save Item Stats + Delete Saved buttons, saved to LunarMenu/itemstats.json
-	    falls back to table.key = value when rawset/rawget are unavailable
-	    baseline snapshot restored on delete
-	+ Mobile Buttons section is mobile-only; added Auto Load Buttons switch
+	LUNAR MENU — v2.3.0
 	+ Auto Complete rewritten: prompts forced to HoldDuration 0, BuildBlueprintAdd fired directly
-	+ Animal ESP off Heartbeat, throttled
-	+ Every ESP has saved fill / outline / text colours
+	    (5 materials x 4 rounds per stage, 8 rounds for Thatch Hut / Mud, skips Fiber Basket & Fire Pit)
+	    "not" -> "can" interceptor kept as a fallback for manual presses
+	+ Animal ESP off Heartbeat, throttled, no Workspace-wide descendant scan
+	+ Every ESP (player / animal / structure) has saved fill, outline and text colours
 	+ Minimise uses its own ScreenGui square; the real window is parked and restored exactly
+	+ Miscellaneous: Make Mobile Buttons Draggable + Save Button Position + Cancel
 	+ Walk Speed text box applied through a __newindex hook (0 preserved)
 	+ No Jump Cooldown via SetStateEnabled hook
+	+ Structure ESP, GOD WEAPON simulation, Item Stats editor
+	+ Wellness / Trap dropdowns multi-select with All / Others / Nearest
 ]]--
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -156,7 +157,6 @@ local autoCompleteStructures = false
 local autoCompleteBurst = false
 
 local mobileDragActive = false
-local mobileAutoLoad = false
 local mobileButtonSnapshot = {}
 
 local changeValueMode = "add"
@@ -249,7 +249,7 @@ end
 ----------------------------------------------------
 local LOGO_ID = "rbxassetid://8498174594"
 local KEYBIND_IMG = "rbxassetid://126810011338788"
-local VERSION = "v2.4.0"
+local VERSION = "v2.3.0"
 
 local function make(class, props, parent)
 	local i = Instance.new(class)
@@ -728,6 +728,7 @@ local function getAnimalGroups()
 	return list
 end
 
+-- player ESP (cheap, stays on Heartbeat)
 RunService.Heartbeat:Connect(function()
 	if fullBrightActive then
 		if Lighting.ClockTime < 6 or Lighting.ClockTime > 18 then
@@ -771,6 +772,7 @@ RunService.Heartbeat:Connect(function()
 	end
 end)
 
+-- animal ESP (throttled, off the heartbeat)
 task.spawn(function()
 	while task.wait(0.22) do
 		if not animalEspActive then continue end
@@ -809,6 +811,7 @@ task.spawn(function()
 	end
 end)
 
+-- structure ESP
 task.spawn(function()
 	while task.wait(0.4) do
 		if structEspActive then
@@ -877,6 +880,7 @@ local function ensureHookSupport()
 	end
 end
 
+-- no jump cooldown
 if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
 	local oldNC
 	oldNC = hookmetamethod(game, "__namecall", wrapClosure(function(self, ...)
@@ -891,6 +895,7 @@ if type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" 
 	end))
 end
 
+-- walkspeed override at the write
 local speedHumanoid = nil
 local function refreshSpeedTarget()
 	speedHumanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid") or nil
@@ -950,6 +955,7 @@ if hookmetamethod and getnamecallmethod and newcclosure then
 	end))
 end
 
+-- blueprint interceptor: keep every argument, swap only "not" -> "can"
 if BuildBlueprintAdd and type(hookmetamethod) == "function" and type(getnamecallmethod) == "function" then
 	local oldNC
 	oldNC = hookmetamethod(game, "__namecall", wrapClosure(function(self, ...)
@@ -1063,8 +1069,6 @@ local SAVE_FILE = SAVE_FOLDER .. "/config.json"
 local FALLBACK_FILE = "LunarMenu_config.json"
 local MOBILE_FILE = SAVE_FOLDER .. "/mobilebuttons.json"
 local MOBILE_FALLBACK = "LunarMenu_mobilebuttons.json"
-local STATS_FILE = SAVE_FOLDER .. "/itemstats.json"
-local STATS_FALLBACK = "LunarMenu_itemstats.json"
 local HAS_FS = (type(writefile) == "function" and type(readfile) == "function")
 local saveQueued = false
 local saveDirty = false
@@ -1090,13 +1094,6 @@ local function fileExists(path)
 	return ok and res == true
 end
 
-local function writeAny(primary, fallback, encoded)
-	local target = ensureSaveFolder() and primary or fallback
-	local wrote = pcall(function() writefile(target, encoded) end)
-	if not wrote then wrote = pcall(function() writefile(fallback, encoded) end) end
-	return wrote and true or false
-end
-
 local function buildConfigTable()
 	local kb = {}
 	for act, key in pairs(keybinds) do kb[act] = key.Name end
@@ -1111,7 +1108,10 @@ local function writeConfigToDisk()
 	if not HAS_FS then return false end
 	local ok, encoded = pcall(function() return HttpService:JSONEncode(buildConfigTable()) end)
 	if not ok or not encoded then return false end
-	return writeAny(SAVE_FILE, FALLBACK_FILE, encoded)
+	local target = ensureSaveFolder() and SAVE_FILE or FALLBACK_FILE
+	local wrote = pcall(function() writefile(target, encoded) end)
+	if not wrote then wrote = pcall(function() writefile(FALLBACK_FILE, encoded) end) end
+	return wrote and true or false
 end
 
 local function saveConfig(force)
@@ -1163,195 +1163,6 @@ local function loadConfig()
 end
 
 pcall(loadConfig)
-
-----------------------------------------------------
--- ITEM STATS PERSISTENCE
-----------------------------------------------------
-local HAS_RAWGET = (type(rawget) == "function")
-local HAS_RAWSET = (type(rawset) == "function")
-local statsEdited = {}
-local statsBaseline = {}
-
--- read with rawget when available, otherwise plain indexing
-local function getStat(tbl, key)
-	if HAS_RAWGET then
-		local ok, v = pcall(rawget, tbl, key)
-		if ok then return v end
-	end
-	return tbl[key]
-end
-
--- write with rawset when available, otherwise table.Key = value
-local function setStat(tbl, key, value)
-	if HAS_RAWSET then
-		local ok = pcall(rawset, tbl, key, value)
-		if ok then return true end
-	end
-	local ok2 = pcall(function() tbl[key] = value end)
-	return ok2
-end
-
-local function deepCopy(v)
-	if type(v) ~= "table" then return v end
-	local c = {}
-	for k, x in pairs(v) do c[k] = deepCopy(x) end
-	return c
-end
-
-local function serializeValue(v)
-	local t = typeof(v)
-	if t == "number" then return tostring(v)
-	elseif t == "string" then return v
-	elseif t == "boolean" then return tostring(v)
-	elseif t == "Vector3" then return string.format("%g, %g, %g", v.X, v.Y, v.Z)
-	elseif t == "table" then
-		local isArray = true
-		for k in pairs(v) do if type(k) ~= "number" then isArray = false; break end end
-		local parts = {}
-		if isArray then
-			for _, x in ipairs(v) do table.insert(parts, tostring(x)) end
-			return table.concat(parts, ", ")
-		end
-		for k, x in pairs(v) do
-			if type(x) == "table" then
-				local inner = {}
-				for _, y in ipairs(x) do table.insert(inner, tostring(y)) end
-				table.insert(parts, tostring(k) .. "=" .. table.concat(inner, "|"))
-			else
-				table.insert(parts, tostring(k) .. "=" .. tostring(x))
-			end
-		end
-		return table.concat(parts, "; ")
-	end
-	return tostring(v)
-end
-
-local function parseValue(text, original)
-	local t = typeof(original)
-	if t == "number" then return tonumber(text) or original end
-	if t == "boolean" then
-		local lt = text:lower()
-		if lt == "true" then return true elseif lt == "false" then return false end
-		return original
-	end
-	if t == "Vector3" then
-		local a, b, c = text:match("(-?[%d%.]+)%s*,%s*(-?[%d%.]+)%s*,%s*(-?[%d%.]+)")
-		if a then return Vector3.new(tonumber(a), tonumber(b), tonumber(c)) end
-		return original
-	end
-	if t == "table" then
-		local out = {}
-		if text:find("=") then
-			for pair in text:gmatch("[^;]+") do
-				local k, val = pair:match("^%s*(.-)%s*=%s*(.-)%s*$")
-				if k then
-					local inner = {}
-					for piece in val:gmatch("[^|]+") do
-						table.insert(inner, (piece:match("^%s*(.-)%s*$")))
-					end
-					out[k] = inner
-				end
-			end
-			return out
-		end
-		for piece in text:gmatch("[^,]+") do
-			local s = piece:match("^%s*(.-)%s*$")
-			if s ~= "" then table.insert(out, s) end
-		end
-		return out
-	end
-	return text
-end
-
-local function captureStatsBaseline()
-	statsBaseline = {}
-	for name, d in pairs(ItemStats) do
-		if type(d) == "table" then statsBaseline[name] = deepCopy(d) end
-	end
-end
-
-local function saveItemStats()
-	if not HAS_FS then showNotification("Executor has no file functions", 1.8); return end
-	local out = {}
-	local itemCount = 0
-	for name in pairs(statsEdited) do
-		local d = ItemStats[name]
-		if type(d) == "table" then
-			local keys = {}
-			for k in pairs(d) do
-				local v = getStat(d, k)
-				local t = typeof(v)
-				if t == "number" or t == "string" or t == "boolean" or t == "Vector3" or t == "table" then
-					keys[tostring(k)] = serializeValue(v)
-				end
-			end
-			out[name] = keys
-			itemCount += 1
-		end
-	end
-	if itemCount == 0 then showNotification("No item stats edited yet", 1.8); return end
-	local ok, encoded = pcall(function() return HttpService:JSONEncode(out) end)
-	if not ok or not encoded then showNotification("Encode failed", 1.6); return end
-	local wrote = writeAny(STATS_FILE, STATS_FALLBACK, encoded)
-	showNotification(wrote and ("Saved stats for " .. itemCount .. " item(s)") or "Save failed", 1.8)
-end
-
-local function loadItemStats()
-	if not HAS_FS then return 0 end
-	local raw
-	for _, path in ipairs({ STATS_FILE, STATS_FALLBACK }) do
-		if fileExists(path) then
-			local ok, r = pcall(readfile, path)
-			if ok and r and r ~= "" then raw = r; break end
-		end
-	end
-	if not raw then return 0 end
-	local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
-	if not ok or type(data) ~= "table" then return 0 end
-
-	local applied = 0
-	for name, keys in pairs(data) do
-		local d = ItemStats[name]
-		if type(d) == "table" and type(keys) == "table" then
-			for key, text in pairs(keys) do
-				local realKey = tonumber(key) or key
-				local original = getStat(d, realKey)
-				if original ~= nil and type(text) == "string" then
-					if setStat(d, realKey, parseValue(text, original)) then applied += 1 end
-				end
-			end
-			statsEdited[name] = true
-		end
-	end
-	return applied
-end
-
-local function deleteItemStats()
-	local removed = false
-	if type(delfile) == "function" then
-		for _, path in ipairs({ STATS_FILE, STATS_FALLBACK }) do
-			if fileExists(path) then pcall(delfile, path); removed = true end
-		end
-	end
-	local restored = 0
-	for name, base in pairs(statsBaseline) do
-		local d = ItemStats[name]
-		if type(d) == "table" then
-			for k in pairs(d) do
-				if base[k] == nil then pcall(function() d[k] = nil end) end
-			end
-			for k, v in pairs(base) do
-				if setStat(d, k, deepCopy(v)) then restored += 1 end
-			end
-		end
-	end
-	statsEdited = {}
-	showNotification(removed and ("Deleted saved stats, restored " .. restored .. " value(s)")
-		or "No saved item stats found", 1.8)
-end
-
-captureStatsBaseline()
-pcall(loadItemStats)
 
 ----------------------------------------------------
 -- MOBILE BUTTON DRAGGER
@@ -1435,7 +1246,9 @@ local function saveMobilePositions()
 	end
 	local ok, encoded = pcall(function() return HttpService:JSONEncode(out) end)
 	if not ok or not encoded then showNotification("Encode failed", 1.6); return end
-	local wrote = writeAny(MOBILE_FILE, MOBILE_FALLBACK, encoded)
+	local target = ensureSaveFolder() and MOBILE_FILE or MOBILE_FALLBACK
+	local wrote = pcall(function() writefile(target, encoded) end)
+	if not wrote then wrote = pcall(function() writefile(MOBILE_FALLBACK, encoded) end) end
 	showNotification(wrote and ("Saved " .. #list .. " button position(s)") or "Save failed", 1.8)
 end
 
@@ -1449,21 +1262,6 @@ local function cancelMobilePositions()
 	end
 	showNotification(n > 0 and ("Reverted " .. n .. " button(s)") or "Nothing to revert", 1.5)
 end
-
--- auto load: applies once per HUD instance when the switch is on
-local mobileAutoLoadedFor = nil
-task.spawn(function()
-	while task.wait(1) do
-		if mobileAutoLoad and not mobileDragActive then
-			local root = mobileButtonRoot()
-			if root and mobileAutoLoadedFor ~= root then
-				mobileAutoLoadedFor = root
-				local n = loadMobilePositions()
-				if n > 0 then showNotification("Auto-loaded " .. n .. " button position(s)", 1.6) end
-			end
-		end
-	end
-end)
 
 ----------------------------------------------------
 -- STARTUP FLAGS
@@ -1493,10 +1291,10 @@ end
 
 local function autoCompleteStructure(model)
 	local name = model.Name
-	if AUTO_SKIP[name] then return 0 end
+	if AUTO_SKIP[name] then return 0, true end
 	local holder = model:FindFirstChild("prompt")
 	local prompt = holder and holder:FindFirstChild("ProximityPrompt")
-	if not prompt then return 0 end
+	if not prompt then return 0, false end
 	promptInstant(prompt)
 
 	local rounds = autoRoundsFor(name)
@@ -1505,8 +1303,10 @@ local function autoCompleteStructure(model)
 		local idx = model:GetAttribute("CurrentStageIndex")
 		if idx == nil or not model.Parent then break end
 		local stageName = "Stage" .. (idx + 1)
+		-- instant prompt trigger: makes the server create its one-shot listener
 		pcall(function() prompt:InputHoldBegin() end)
 		pcall(function() prompt:InputHoldEnd() end)
+		-- fire the remote manually, all arguments, every material, repeated
 		for _ = 1, rounds do
 			for _, mat in ipairs(AUTO_MATERIALS) do
 				if BuildBlueprintAdd then
@@ -1517,7 +1317,7 @@ local function autoCompleteStructure(model)
 		end
 		task.wait(0.06)
 	end
-	return fired
+	return fired, true
 end
 
 local function autoCompleteNear()
@@ -1549,7 +1349,8 @@ local function autoCompleteNear()
 	task.spawn(function()
 		local done, total = 0, 0
 		for _, m in ipairs(list) do
-			total += autoCompleteStructure(m)
+			local fired = autoCompleteStructure(m)
+			total += fired
 			done += 1
 		end
 		task.wait(0.3)
@@ -1558,6 +1359,7 @@ local function autoCompleteNear()
 	end)
 end
 
+-- keep every structure prompt instant while the switch is on
 task.spawn(function()
 	while task.wait(1) do
 		if autoCompleteStructures then
@@ -1566,7 +1368,8 @@ task.spawn(function()
 			if folder then
 				for _, m in ipairs(folder:GetDescendants()) do
 					local holder = m:FindFirstChild("prompt")
-					local prompt = holder and holder:FindFirstChild("ProximityPrompt")
+					local prompt = holder and holder:FindFirstChild("Prompt")
+					prompt = holder and holder:FindFirstChild("ProximityPrompt") or prompt
 					if prompt and prompt.HoldDuration ~= 0 then promptInstant(prompt) end
 				end
 			end
@@ -2525,7 +2328,7 @@ createMasterUI = function()
 	end
 
 	------------------------------------------------
-	-- DROPDOWN
+	-- DROPDOWN (multi-select capable)
 	------------------------------------------------
 	local function createDropdown(parent, title, entries, onSelect, opts)
 		opts = opts or {}
@@ -2694,7 +2497,7 @@ createMasterUI = function()
 	end
 
 	------------------------------------------------
-	-- COLOR PICKER
+	-- COLOR PICKER (any table)
 	------------------------------------------------
 	local function createColorPicker(parent, label, key, tbl)
 		tbl = tbl or T
@@ -4028,6 +3831,95 @@ createMasterUI = function()
 
 		local statsSnapshots = {}
 
+		local function copyValue(v)
+			if type(v) == "table" then
+				local c = {}
+				for k, x in pairs(v) do
+					if type(x) == "table" then
+						local c2 = {}
+						for k2, x2 in pairs(x) do c2[k2] = x2 end
+						c[k] = c2
+					else
+						c[k] = x
+					end
+				end
+				return c
+			end
+			return v
+		end
+
+		local function serializeValue(v)
+			local t = typeof(v)
+			if t == "number" then return tostring(v)
+			elseif t == "string" then return v
+			elseif t == "boolean" then return tostring(v)
+			elseif t == "Vector3" then return string.format("%g, %g, %g", v.X, v.Y, v.Z)
+			elseif t == "table" then
+				local isArray = true
+				for k in pairs(v) do if type(k) ~= "number" then isArray = false; break end end
+				local parts = {}
+				if isArray then
+					for _, x in ipairs(v) do table.insert(parts, tostring(x)) end
+					return table.concat(parts, ", ")
+				end
+				for k, x in pairs(v) do
+					if type(x) == "table" then
+						local inner = {}
+						for _, y in ipairs(x) do table.insert(inner, tostring(y)) end
+						table.insert(parts, tostring(k) .. "=" .. table.concat(inner, "|"))
+					else
+						table.insert(parts, tostring(k) .. "=" .. tostring(x))
+					end
+				end
+				return table.concat(parts, "; ")
+			end
+			return tostring(v)
+		end
+
+		local function parseValue(text, original)
+			local t = typeof(original)
+			if t == "number" then return tonumber(text) or original end
+			if t == "boolean" then
+				local lt = text:lower()
+				if lt == "true" then return true elseif lt == "false" then return false end
+				return original
+			end
+			if t == "Vector3" then
+				local a, b, c = text:match("(-?[%d%.]+)%s*,%s*(-?[%d%.]+)%s*,%s*(-?[%d%.]+)")
+				if a then return Vector3.new(tonumber(a), tonumber(b), tonumber(c)) end
+				return original
+			end
+			if t == "table" then
+				local out = {}
+				if text:find("=") then
+					for pair in text:gmatch("[^;]+") do
+						local k, val = pair:match("^%s*(.-)%s*=%s*(.-)%s*$")
+						if k then
+							local inner = {}
+							for piece in val:gmatch("[^|]+") do
+								table.insert(inner, (piece:match("^%s*(.-)%s*$")))
+							end
+							out[k] = inner
+						end
+					end
+					return out
+				end
+				for piece in text:gmatch("[^,]+") do
+					local s = piece:match("^%s*(.-)%s*$")
+					if s ~= "" then table.insert(out, s) end
+				end
+				return out
+			end
+			return text
+		end
+
+		local function setStat(tbl, key, value)
+			local ok = pcall(rawset, tbl, key, value)
+			if not ok then pcall(function() tbl[key] = value end) end
+		end
+
+		local buildStatsEditor
+
 		local function itemStatsEntries()
 			local names = {}
 			for k in pairs(ItemStats) do table.insert(names, tostring(k)) end
@@ -4045,7 +3937,7 @@ createMasterUI = function()
 			return list
 		end
 
-		local function buildStatsEditor(name)
+		buildStatsEditor = function(name)
 			statsEditor:ClearAllChildren()
 			make("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, statsEditor)
 			local data = ItemStats[name]
@@ -4055,7 +3947,7 @@ createMasterUI = function()
 					TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left }, statsEditor)
 				return
 			end
-			if not statsSnapshots[name] then statsSnapshots[name] = deepCopy(data) end
+			if not statsSnapshots[name] then statsSnapshots[name] = copyValue(data) end
 
 			local keys = {}
 			for k in pairs(data) do table.insert(keys, tostring(k)) end
@@ -4071,25 +3963,24 @@ createMasterUI = function()
 			corner(resetBtn, 6); stroke(resetBtn, T.Stroke, 0.4)
 			resetBtn.MouseButton1Click:Connect(function()
 				local snap = statsSnapshots[name]
-				for k, v in pairs(snap) do setStat(data, k, deepCopy(v)) end
-				statsEdited[name] = true
+				for k, v in pairs(snap) do setStat(data, k, copyValue(v)) end
 				buildStatsEditor(name)
 				showNotification("Reset " .. name, 1.3)
 			end)
 
 			for _, key in ipairs(keys) do
+				local v = data[key]
 				local row = make("Frame", { Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1 }, statsEditor)
 				make("TextLabel", { Size = UDim2.new(0.4, 0, 1, 0), BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
 					Text = key, TextColor3 = T.Dim, TextSize = 10,
 					TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd }, row)
 				local box = make("TextBox", { Size = UDim2.new(0.58, 0, 1, 0), Position = UDim2.new(0.42, 0, 0, 0),
-					Text = serializeValue(getStat(data, key)) }, row)
+					Text = serializeValue(v) }, row)
 				styleField(box); box.TextSize = 10
 				box.FocusLost:Connect(function()
-					local original = getStat(data, key)
-					setStat(data, key, parseValue(box.Text, original))
-					statsEdited[name] = true
-					box.Text = serializeValue(getStat(data, key))
+					local parsed = parseValue(box.Text, data[key])
+					setStat(data, key, parsed)
+					box.Text = serializeValue(data[key])
 					showNotification(key .. " updated", 1)
 				end)
 			end
@@ -4101,55 +3992,28 @@ createMasterUI = function()
 		end, { tip = "Pick an item, then edit any of its keys below" })
 		statsDrop.setEntries(itemStatsEntries())
 
-		local statsRow = make("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, p)
-		local saveStats = createButton(statsRow, "Save Item Stats", Color3.fromRGB(38, 110, 60),
-			"Write every edited item's values to disk")
-		saveStats.Size = UDim2.new(0.62, 0, 1, 0)
-		saveStats.MouseButton1Click:Connect(saveItemStats)
-		local delStats = createButton(statsRow, "Delete Saved", Color3.fromRGB(140, 50, 60),
-			"Delete the saved file and restore the original values")
-		delStats.Size = UDim2.new(0.35, 0, 1, 0)
-		delStats.Position = UDim2.new(0.65, 0, 0, 0)
-		delStats.MouseButton1Click:Connect(function()
-			deleteItemStats()
-			statsSnapshots = {}
-		end)
-
 		------------------------------------------------
-		-- MOBILE BUTTONS (mobile only)
+		-- MOBILE BUTTONS
 		------------------------------------------------
-		if IS_MOBILE then
-			sectionTitle(p, "Mobile Buttons")
-			createToggle(p, "Make Mobile Buttons Draggable", mobileDragActive, function(v)
-				setMobileButtonsDraggable(v)
-			end, "Lets you drag the game's HUD buttons around", false)
+		sectionTitle(p, "Mobile Buttons")
+		createToggle(p, "Make Mobile Buttons Draggable", mobileDragActive, function(v)
+			setMobileButtonsDraggable(v)
+		end, "Lets you drag the game's HUD buttons around", false)
 
-			local mbRow = make("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, p)
-			local savePos = createButton(mbRow, "Save Button Position", Color3.fromRGB(38, 110, 60),
-				"Write the current button positions to disk")
-			savePos.Size = UDim2.new(0.62, 0, 1, 0)
-			savePos.MouseButton1Click:Connect(saveMobilePositions)
-			local cancelPos = createButton(mbRow, "Cancel", Color3.fromRGB(140, 50, 60),
-				"Restore the positions from before you started dragging")
-			cancelPos.Size = UDim2.new(0.35, 0, 1, 0)
-			cancelPos.Position = UDim2.new(0.65, 0, 0, 0)
-			cancelPos.MouseButton1Click:Connect(cancelMobilePositions)
+		local mbRow = make("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, p)
+		local savePos = createButton(mbRow, "Save Button Position", Color3.fromRGB(38, 110, 60),
+			"Write the current button positions to disk")
+		savePos.Size = UDim2.new(0.62, 0, 1, 0)
+		savePos.MouseButton1Click:Connect(saveMobilePositions)
+		local cancelPos = createButton(mbRow, "Cancel", Color3.fromRGB(140, 50, 60),
+			"Restore the positions from before you started dragging")
+		cancelPos.Size = UDim2.new(0.35, 0, 1, 0)
+		cancelPos.Position = UDim2.new(0.65, 0, 0, 0)
+		cancelPos.MouseButton1Click:Connect(cancelMobilePositions)
 
-			createToggle(p, "Auto Load Buttons", mobileAutoLoad, function(v)
-				mobileAutoLoad = v
-				mobileAutoLoadedFor = nil
-				if v then
-					task.defer(function()
-						local n = loadMobilePositions()
-						showNotification(n > 0 and ("Auto-loaded " .. n .. " button position(s)") or "Nothing saved yet", 1.6)
-					end)
-				end
-			end, "Apply the saved button positions automatically on join", false)
-
-			make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
-				Text = "Saved positions are re-applied the next time you enable dragging.",
-				TextColor3 = T.Dim, TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left }, p)
-		end
+		make("TextLabel", { Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
+			Text = "Saved positions are re-applied the next time you enable dragging.",
+			TextColor3 = T.Dim, TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left }, p)
 	end
 
 	------------------------------------------------
@@ -4394,6 +4258,7 @@ createMasterUI = function()
 			TweenService:Create(glow, ti, { Size = targetSize, Position = targetPos }):Play()
 			tw:Play()
 			tw.Completed:Connect(function()
+				-- park the real window exactly where it was, then hide it
 				main.Visible = false
 				glow.Visible = false
 				main.Size = normalSize
@@ -4614,7 +4479,6 @@ LocalPlayer.CharacterAdded:Connect(function(ch)
 	task.wait(0.2)
 	pcall(setupAllItemsAsThrowables)
 	refreshSpeedTarget()
-	mobileAutoLoadedFor = nil
 	createMasterUI()
 	local hum = ch:FindFirstChildOfClass("Humanoid")
 	if hum then hum.WalkSpeed = walkBoostActive and walkSpeedValue or 12 end
