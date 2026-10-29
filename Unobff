@@ -1,13 +1,9 @@
 --[[
-	LUNAR MENU — v2.6.1
-	+ Handles / ArcHandles now actually render (anchor part + Faces.new)
-	+ Tools toggle off when clicked again; selected model click unselects
-	+ Empty sandbox auto-cancels the session
-	+ Copy no longer leaves stale adornments / stuck drag state
-	+ Mobile freecam uses draggable ▲ / ▼ buttons, camera-relative
-	+ Camera Speed slider (0.12 – 1.5)
-	+ Undo / Redo are arm-then-click tools
-	+ No dotted line while moving
+	LUNAR MENU — v2.6.2
+	+ Handles / ArcHandles hold properly (gizmo drag no longer stolen by free-drag)
+	+ Cursor drag lifts by the model bounding box so nothing clips the floor
+	+ Builder only notifies on delete / undo / redo / select-first
+	+ Camera speed + sensitivity persist to disk
 ]]--
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -247,7 +243,7 @@ end
 ----------------------------------------------------
 local LOGO_ID = "rbxassetid://8498174594"
 local KEYBIND_IMG = "rbxassetid://126810011338788"
-local VERSION = "v2.6.1"
+local VERSION = "v2.6.2"
 
 local function make(class, props, parent)
 	local i = Instance.new(class)
@@ -1124,7 +1120,8 @@ local function buildConfigTable()
 	for k, c in pairs(T) do th[k] = { c.R, c.G, c.B } end
 	local esp = {}
 	for k, c in pairs(espColors) do esp[k] = { c.R, c.G, c.B } end
-	return { keybinds = kb, theme = th, esp = esp, mobile = { autoPlace = autoPlaceMobile } }
+	return { keybinds = kb, theme = th, esp = esp, mobile = { autoPlace = autoPlaceMobile },
+		builder = { sens = buildState.CameraSensitivity, speed = buildState.CameraSpeed } }
 end
 
 local function writeConfigToDisk()
@@ -1185,6 +1182,14 @@ local function loadConfig()
 	end
 	if type(data.mobile) == "table" then
 		autoPlaceMobile = data.mobile.autoPlace == true
+	end
+	if type(data.builder) == "table" then
+		if tonumber(data.builder.sens) then
+			buildState.CameraSensitivity = math.clamp(tonumber(data.builder.sens), 0.01, 0.2)
+		end
+		if tonumber(data.builder.speed) then
+			buildState.CameraSpeed = math.clamp(tonumber(data.builder.speed), 0.12, 1.5)
+		end
 	end
 end
 
@@ -3448,7 +3453,6 @@ createMasterUI = function()
 
 		local function ensureNotEmpty()
 			if buildState.IsConstructing and #allModels() == 0 then
-				showNotification("Sandbox empty — construct cancelled", 1.6)
 				if cancelConstruct then cancelConstruct() end
 			end
 		end
@@ -3484,7 +3488,7 @@ createMasterUI = function()
 			part.Name = "LunarHandleAnchor"
 			part.Anchored = true
 			part.CanCollide = false
-			part.CanQuery = false
+			part.CanQuery = true
 			part.CanTouch = false
 			part.CastShadow = false
 			part.Transparency = 1
@@ -3619,6 +3623,7 @@ createMasterUI = function()
 			local prev = table.remove(undoStack)
 			table.insert(redoStack, current)
 			historyBusy = true; restore(prev); historyBusy = false
+			showNotification("Undo", 1)
 			ensureNotEmpty()
 		end
 
@@ -3628,6 +3633,7 @@ createMasterUI = function()
 			local nxt = table.remove(redoStack)
 			table.insert(undoStack, current)
 			historyBusy = true; restore(nxt); historyBusy = false
+			showNotification("Redo", 1)
 			ensureNotEmpty()
 		end
 
@@ -3636,9 +3642,11 @@ createMasterUI = function()
 		------------------------------------------------
 		local function deleteSelected()
 			if #selected == 0 then return end
+			local n = #selected
 			pushHistory()
 			for _, m in ipairs(selected) do m:Destroy() end
 			clearSelection()
+			showNotification("Deleted " .. n .. " structure(s)", 1.2)
 			ensureNotEmpty()
 		end
 
@@ -3758,7 +3766,6 @@ createMasterUI = function()
 				tool = nil
 				highlightTool(nil)
 				clearHandles()
-				showNotification("Tool put down", 1)
 				return
 			end
 			if #selected == 0 and (id == "Move" or id == "Rotate") then
@@ -3935,7 +3942,9 @@ createMasterUI = function()
 			if tool == "Rotate" then
 				dragging = { mode = "rotate", model = model, pivot = pivot, startX = pointer.X }
 			else
-				dragging = { mode = "free", model = model, pivot = pivot, offset = pivot.Position - hitPos }
+				local _, size = model:GetBoundingBox()
+				dragging = { mode = "free", model = model, pivot = pivot,
+					offset = pivot.Position - hitPos, lift = size.Y * 0.5 }
 			end
 		end
 
@@ -3943,8 +3952,10 @@ createMasterUI = function()
 			if pendingDrag then
 				if not pendingDrag.model or not pendingDrag.model.Parent then
 					pendingDrag = nil
-				elseif os.clock() - pendingDrag.at >= 0.12
-					or (pointer - pendingDrag.from).Magnitude > 6 then
+				elseif dragging and dragging.mode == "native" then
+					pendingDrag = nil
+				elseif os.clock() - pendingDrag.at >= 0.2
+					or (pointer - pendingDrag.from).Magnitude > 10 then
 					beginModelDrag(pendingDrag.model, pendingDrag.hitPos)
 					pendingDrag = nil
 				end
@@ -3959,12 +3970,15 @@ createMasterUI = function()
 			if dragging.mode == "free" then
 				local hit = surfaceRay()
 				if hit then
-					local np = hit.Position + dragging.offset
+					local lift = dragging.lift or 0
+					local surfaceY = hit.Position.Y + lift
+					local np
 					if buildState.DragToCursor then
-						np = Vector3.new(snapScalar(np.X, buildState.MoveIncrement), np.Y,
-							snapScalar(np.Z, buildState.MoveIncrement))
+						np = Vector3.new(snapScalar(hit.Position.X, buildState.MoveIncrement), surfaceY,
+							snapScalar(hit.Position.Z, buildState.MoveIncrement))
 					else
-						np = snapVec(np, buildState.MoveIncrement)
+						local raw = snapVec(hit.Position + dragging.offset, buildState.MoveIncrement)
+						np = Vector3.new(raw.X, surfaceY, raw.Z)
 					end
 					local cf = CFrame.new(np) * rot
 					model:PivotTo(cf)
@@ -4017,6 +4031,7 @@ createMasterUI = function()
 			if tool == "Delete" then deleteSelected()
 			elseif tool == "Copy" then cloneSelected()
 			elseif tool == "Move" or tool == "Rotate" then
+				if dragging and dragging.mode == "native" then return end
 				pendingDrag = { model = model, hitPos = hitPos, at = os.clock(), from = pointer }
 			end
 		end
@@ -4139,7 +4154,6 @@ createMasterUI = function()
 				refreshConstructButton()
 				return
 			end
-			showNotification("Constructing: " .. name, 1.4)
 		end
 
 		local function addAnother()
@@ -4230,11 +4244,12 @@ createMasterUI = function()
 		end, "Dragging a model follows your cursor and the terrain under it", false)
 
 		createSlider(setBody, "Camera Speed", 0.12, 1.5, buildState.CameraSpeed, 0.01,
-			function(v) buildState.CameraSpeed = v end, "Freecam travel speed — 0.12 is the current default")
+			function(v) buildState.CameraSpeed = v; saveConfig() end,
+			"Freecam travel speed — 0.12 is the current default")
 
 		if IS_MOBILE then
 			createSlider(setBody, "Camera Sensitivity", 0.01, 0.2, buildState.CameraSensitivity, 0.01,
-				function(v) buildState.CameraSensitivity = v end, "Freecam look speed on touch")
+				function(v) buildState.CameraSensitivity = v; saveConfig() end, "Freecam look speed on touch")
 		end
 
 		------------------------------------------------
