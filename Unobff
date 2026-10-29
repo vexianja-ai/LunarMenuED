@@ -1,11 +1,10 @@
 --[[
-	LUNAR MENU — v2.5.0
-	+ Structure building rebuilt: sandbox construct system with tool hotbar
-	  (undo / redo / move / copy / rotate / delete / camera), adornment handles,
-	  selection boxes, freecam, dotted cursor line and confirm prompts
-	+ Item Stats save-to-disk / cancel
-	+ Mobile-only drag + auto-place-on-join, PC keybind overlay
-	+ Undo / Redo text fallback, mobile freecam sensitivity
+	LUNAR MENU — v2.6.0
+	+ Builder gizmos now use the native Handles / ArcHandles objects
+	+ Selection only with an empty tool slot; tools act on the selected model
+	+ Shared searchable picker with 3D thumbnails for structures and item stats
+	+ Mobile freecam reads the real thumbstick; sensitivity 0.01 – 0.2
+	+ Fixed protect-extras typo that killed resize / minimise
 ]]--
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -245,7 +244,7 @@ end
 ----------------------------------------------------
 local LOGO_ID = "rbxassetid://8498174594"
 local KEYBIND_IMG = "rbxassetid://126810011338788"
-local VERSION = "v2.5.0"
+local VERSION = "v2.6.0"
 
 local function make(class, props, parent)
 	local i = Instance.new(class)
@@ -309,6 +308,29 @@ local function ripple(btn)
 		Size = UDim2.new(0, size, 0, size), BackgroundTransparency = 1
 	}):Play()
 	Debris:AddItem(r, 0.5)
+end
+local function previewModel(parent, model, size)
+	local vp = make("ViewportFrame", { Size = size, BackgroundColor3 = T.PanelD, BackgroundTransparency = 0.4 }, parent)
+	corner(vp, 6)
+	local cam = newViewportCamera(vp)
+	vp.CurrentCamera = cam
+	local world = make("WorldModel", {}, vp)
+	if not model then
+		cam.CFrame = CFrame.new(Vector3.new(3, 3, 3), Vector3.zero)
+		return vp
+	end
+	local clone = model:Clone()
+	clone.Parent = world
+	if clone:IsA("Model") then
+		clone:PivotTo(CFrame.new())
+		local ok, bounds = pcall(function() local _, b = clone:GetBoundingBox(); return b end)
+		local dist = (ok and bounds and bounds.Magnitude or 4) * 0.9 + 1.5
+		cam.CFrame = CFrame.new(Vector3.new(1, 0.65, 1).Unit * dist, Vector3.zero)
+	elseif clone:IsA("BasePart") then
+		clone.CFrame = CFrame.new()
+		cam.CFrame = CFrame.new(Vector3.new(1, 0.65, 1).Unit * (clone.Size.Magnitude * 0.9 + 1.5), Vector3.zero)
+	end
+	return vp
 end
 
 ----------------------------------------------------
@@ -375,7 +397,8 @@ local buildState = {
 	BoundingBoxPart = nil,
 	RenderConnection = nil,
 	ViewportViewModel = nil,
-	ViewportCharModel = nil
+	ViewportCharModel = nil,
+	CameraSensitivity = 0.12,
 }
 
 ----------------------------------------------------
@@ -1164,12 +1187,41 @@ end
 pcall(loadConfig)
 
 ----------------------------------------------------
--- MOBILE BUTTON DRAGGER
+-- MOBILE BUTTONS / THUMBSTICK
 ----------------------------------------------------
 local function mobileButtonRoot()
 	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
 	local hud = pg and pg:FindFirstChild("HUD")
 	return hud and hud:FindFirstChild("MobileButtons")
+end
+
+local function readThumbstick()
+	local root = mobileButtonRoot()
+	if not root then return Vector2.zero end
+	local stick
+	for _, d in ipairs(root:GetDescendants()) do
+		local n = d.Name:lower()
+		if d:IsA("GuiObject") and (n:find("thumb") or n:find("stick") or n:find("joystick")) then
+			stick = d
+			break
+		end
+	end
+	if not stick then return Vector2.zero end
+	local centre = stick.AbsolutePosition + stick.AbsoluteSize / 2
+	local radius = math.min(stick.AbsoluteSize.X, stick.AbsoluteSize.Y) / 2
+	if radius <= 1 then return Vector2.zero end
+	local best, bestDist = nil, 0
+	for _, d in ipairs(stick:GetDescendants()) do
+		if d:IsA("GuiObject") then
+			local c = d.AbsolutePosition + d.AbsoluteSize / 2
+			local dist = (c - centre).Magnitude
+			if dist > bestDist then best, bestDist = d, dist end
+		end
+	end
+	if not best then return Vector2.zero end
+	local delta = (best.AbsolutePosition + best.AbsoluteSize / 2 - centre) / radius
+	if delta.Magnitude < 0.12 then return Vector2.zero end
+	return Vector2.new(delta.X, -delta.Y)
 end
 
 local function mobileButtonKey(obj, root)
@@ -2506,7 +2558,7 @@ createMasterUI = function()
 	end
 
 	------------------------------------------------
-	-- COLOR PICKER (any table)
+	-- COLOR PICKER
 	------------------------------------------------
 	local function createColorPicker(parent, label, key, tbl)
 		tbl = tbl or T
@@ -2585,6 +2637,85 @@ createMasterUI = function()
 		makeBar(80, function() return v end, function(x) v = x; refresh() end)
 		refresh()
 		return holder
+	end
+
+	------------------------------------------------
+	-- SHARED PICKER
+	------------------------------------------------
+	local function openPicker(title, entries, onPick)
+		local old = gui:FindFirstChild("LunarPicker"); if old then old:Destroy() end
+		local vp = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(1280, 720)
+		local w = math.min(460, vp.X - 40)
+		local h = math.min(500, vp.Y - 80)
+		local f = make("Frame", { Name = "LunarPicker", Size = UDim2.fromOffset(w, 0),
+			Position = UDim2.new(0.5, -w / 2, 0.5, -h / 2), BackgroundColor3 = T.Bg2, BorderSizePixel = 0,
+			ClipsDescendants = true, ZIndex = 70 }, gui)
+		corner(f, 12); stroke(f, T.Accent, 0.15, 1.5)
+		TweenService:Create(f, TweenInfo.new(0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+			{ Size = UDim2.fromOffset(w, h) }):Play()
+
+		make("TextLabel", { Size = UDim2.new(1, -30, 0, 26), Position = UDim2.fromOffset(16, 10),
+			BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = title,
+			TextColor3 = T.Text, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left }, f)
+
+		local search = make("TextBox", { Size = UDim2.new(1, -32, 0, 30), Position = UDim2.fromOffset(16, 40),
+			PlaceholderText = "Search...", Text = "" }, f)
+		styleField(search)
+
+		local list = make("ScrollingFrame", { Size = UDim2.new(1, -32, 1, -132), Position = UDim2.fromOffset(16, 78),
+			BackgroundColor3 = T.Field, BorderSizePixel = 0, CanvasSize = UDim2.new(), ScrollBarThickness = 4,
+			AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarImageColor3 = T.Accent }, f)
+		corner(list, 8); stroke(list, T.Stroke, 0.5)
+		make("UIListLayout", { Padding = UDim.new(0, 4) }, list)
+		make("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6),
+			PaddingRight = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6) }, list)
+
+		local function fill(filter)
+			for _, c in ipairs(list:GetChildren()) do
+				if c:IsA("TextButton") then c:Destroy() end
+			end
+			filter = (filter or ""):lower()
+			local shown = 0
+			for _, e in ipairs(entries) do
+				if filter == "" or e.name:lower():find(filter, 1, true) then
+					local row = make("TextButton", { Size = UDim2.new(1, 0, 0, 44), BackgroundColor3 = T.PanelD,
+						Text = "", AutoButtonColor = false }, list)
+					corner(row, 7); hover(row, T.PanelD, T.Hover)
+					if e.model or e.image then
+						if e.image then
+							local img = make("ImageLabel", { Size = UDim2.fromOffset(38, 38), Position = UDim2.fromOffset(3, 3),
+								BackgroundColor3 = T.PanelD, Image = e.image }, row)
+							corner(img, 6)
+						else
+							local vpf = previewModel(row, e.model, UDim2.fromOffset(38, 38))
+							vpf.Position = UDim2.fromOffset(3, 3)
+						end
+					end
+					make("TextLabel", { Size = UDim2.new(1, -56, 1, 0), Position = UDim2.fromOffset(48, 0),
+						BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, Text = e.name,
+						TextColor3 = T.Text, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+						TextTruncate = Enum.TextTruncate.AtEnd }, row)
+					row.MouseButton1Click:Connect(function()
+						playClick(); f:Destroy()
+						if onPick then onPick(e) end
+					end)
+					shown += 1
+				end
+			end
+			if shown == 0 then
+				make("TextLabel", { Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1,
+					Font = Enum.Font.GothamMedium, Text = "no matches", TextColor3 = T.Dim,
+					TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left }, list)
+			end
+		end
+		fill("")
+		search:GetPropertyChangedSignal("Text"):Connect(function() fill(search.Text) end)
+
+		local close = make("TextButton", { Size = UDim2.new(1, -32, 0, 26), Position = UDim2.new(0, 16, 1, -34),
+			BackgroundColor3 = Color3.fromRGB(150, 55, 55), Font = Enum.Font.GothamBold, Text = "Close",
+			TextColor3 = T.Text, TextSize = 11, AutoButtonColor = false }, f)
+		corner(close, 8); stroke(close, T.Stroke, 0.4)
+		close.MouseButton1Click:Connect(function() playClick(); f:Destroy() end)
 	end
 
 	------------------------------------------------
@@ -3160,7 +3291,7 @@ createMasterUI = function()
 		buildState.MoveIncrement = buildState.MoveIncrement or 1
 		buildState.RotateIncrement = buildState.RotateIncrement or 15
 		if buildState.DragToCursor == nil then buildState.DragToCursor = true end
-		if buildState.CameraSensitivity == nil then buildState.CameraSensitivity = 0.3 end
+		buildState.CameraSensitivity = math.clamp(buildState.CameraSensitivity or 0.12, 0.01, 0.2)
 
 		local SANDBOX_NAME = "LunarConstructSandbox"
 		local HANDLE_NAME = "LunarConstructHandles"
@@ -3178,7 +3309,6 @@ createMasterUI = function()
 		local pointer = Vector2.new(0, 0)
 		local undoStack, redoStack = {}, {}
 		local anchor = nil
-		local handleDefs = {}
 		local lineAdorn = {}
 		local historyBusy = false
 
@@ -3218,12 +3348,6 @@ createMasterUI = function()
 			return Vector3.new(snapScalar(v.X, inc), snapScalar(v.Y, inc), snapScalar(v.Z, inc))
 		end
 		local function rotOnly(cf) return cf - cf.Position end
-		local function cframeWithX(pos, dir)
-			local up = math.abs(dir.Y) > 0.99 and Vector3.zAxis or Vector3.yAxis
-			local zAxis = dir:Cross(up).Unit
-			local yAxis = zAxis:Cross(dir).Unit
-			return CFrame.fromMatrix(pos, dir, yAxis, zAxis)
-		end
 
 		local function viewportRay(x, y)
 			return Workspace.CurrentCamera:ViewportPointToRay(x, y)
@@ -3235,22 +3359,6 @@ createMasterUI = function()
 			local t = (planeCF.Position - ray.Origin):Dot(n) / denom
 			if t < 0 then return nil end
 			return ray.Origin + ray.Direction * t
-		end
-		local function axisPlane(pos, axis)
-			local camDir = Workspace.CurrentCamera.CFrame.LookVector
-			local n = camDir - axis * camDir:Dot(axis)
-			if n.Magnitude < 1e-3 then n = Vector3.yAxis end
-			return CFrame.lookAt(pos, pos + n.Unit)
-		end
-		local function worldToScreen(p)
-			local sp = Workspace.CurrentCamera:WorldToViewportPoint(p)
-			if sp.Z <= 0 then return nil end
-			return Vector2.new(sp.X, sp.Y)
-		end
-		local function distToSegment(p, a, b)
-			local ab = b - a
-			local t = math.clamp((p - a):Dot(ab) / math.max(ab:Dot(ab), 1e-4), 0, 1)
-			return (p - (a + ab * t)).Magnitude
 		end
 
 		local function surfaceRay()
@@ -3275,20 +3383,6 @@ createMasterUI = function()
 			while model and model.Parent ~= sandbox do model = model.Parent end
 			if model and model.Parent == sandbox then return model, res.Position end
 			return nil
-		end
-
-		local function pickHandle()
-			if not anchor then return nil end
-			local best, bestDist
-			for _, def in ipairs(handleDefs) do
-				local a = worldToScreen(anchor.CFrame:PointToWorldSpace(def.a))
-				local b = worldToScreen(anchor.CFrame:PointToWorldSpace(def.b))
-				if a and b then
-					local d = distToSegment(pointer, a, b)
-					if d < 28 and (not bestDist or d < bestDist) then best, bestDist = def, d end
-				end
-			end
-			return best
 		end
 
 		local function isChild(model) return model and model.Parent == sandbox end
@@ -3346,61 +3440,24 @@ createMasterUI = function()
 		end
 
 		------------------------------------------------
-		-- ADORNMENT HANDLES
+		-- NATIVE GIZMOS
 		------------------------------------------------
-		local AXES = {
-			{ axis = Vector3.xAxis, color = Color3.fromRGB(255, 80, 80), id = "X" },
-			{ axis = Vector3.yAxis, color = Color3.fromRGB(90, 230, 110), id = "Y" },
-			{ axis = Vector3.zAxis, color = Color3.fromRGB(90, 150, 255), id = "Z" },
-		}
-		local AXIS_LEN = 4.2
+		local gizmo = nil
 
 		function clearHandles()
-			handleDefs = {}
-			anchor = nil
-			for _, c in ipairs(handleFolder:GetChildren()) do c:Destroy() end
+			if gizmo then gizmo:Destroy(); gizmo = nil end
+			if anchor then anchor:Destroy(); anchor = nil end
 			for _, a in ipairs(lineAdorn) do if a then a:Destroy() end end
 			lineAdorn = {}
+			for _, c in ipairs(handleFolder:GetChildren()) do c:Destroy() end
 		end
 
-		local function newAnchor(pivot)
-			anchor = make("Part", { Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
-				CastShadow = false, Transparency = 1, Size = Vector3.new(0.2, 0.2, 0.2),
-				CFrame = pivot }, handleFolder)
-		end
-
-		local function buildArrows()
-			for _, a in ipairs(AXES) do
-				local startP = a.axis * 0.15
-				local endP = a.axis * AXIS_LEN
-				make("LineHandleAdornment", { Adornee = anchor, Length = AXIS_LEN, Thickness = 4,
-					Color3 = a.color, AlwaysOnTop = true,
-					CFrame = cframeWithX(startP + a.axis * (AXIS_LEN / 2), a.axis) }, anchor)
-				make("ConeHandleAdornment", { Adornee = anchor, Radius = 0.36, Height = 0.95,
-					Color3 = a.color, AlwaysOnTop = true,
-					CFrame = cframeWithX(endP, a.axis) * CFrame.Angles(0, 0, math.rad(90)) }, anchor)
-				table.insert(handleDefs, { id = a.id, a = startP, b = endP })
-			end
-		end
-
-		local function buildRing()
-			local segments, radius = 48, 4.6
-			for i = 1, segments do
-				local a1 = ((i - 1) / segments) * math.pi * 2
-				local a2 = (i / segments) * math.pi * 2
-				local p1 = Vector3.new(math.cos(a1) * radius, 0, math.sin(a1) * radius)
-				local p2 = Vector3.new(math.cos(a2) * radius, 0, math.sin(a2) * radius)
-				local dir = (p2 - p1).Unit
-				make("LineHandleAdornment", { Adornee = anchor, Length = (p2 - p1).Magnitude + 0.06,
-					Thickness = 3, Color3 = Color3.fromRGB(255, 200, 70), AlwaysOnTop = true,
-					CFrame = cframeWithX((p1 + p2) / 2, dir) }, anchor)
-				table.insert(handleDefs, { id = "Rotate", a = p1, b = p2 })
-			end
-			for _, d in ipairs({ Vector3.xAxis, Vector3.zAxis }) do
-				make("LineHandleAdornment", { Adornee = anchor, Length = AXIS_LEN, Thickness = 2,
-					Color3 = Color3.fromRGB(175, 175, 175), AlwaysOnTop = true,
-					CFrame = cframeWithX(d * (AXIS_LEN / 2), d) }, anchor)
-			end
+		local function finishDrag()
+			if not dragging then return end
+			pushHistory()
+			dragging = nil
+			clearLine()
+			refreshHandles()
 		end
 
 		function refreshHandles()
@@ -3408,12 +3465,58 @@ createMasterUI = function()
 			local m = primary()
 			if not m or not tool then return end
 			if tool ~= "Move" and tool ~= "Rotate" then return end
-			newAnchor(m:GetPivot())
-			if tool == "Move" then buildArrows() else buildRing() end
-		end
 
-		local function moveHandles(pivot)
-			if anchor then anchor.CFrame = pivot end
+			anchor = make("Part", { Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
+				CastShadow = false, Transparency = 1, Size = Vector3.new(0.2, 0.2, 0.2),
+				CFrame = m:GetPivot() }, handleFolder)
+
+			if tool == "Move" then
+				local h = Instance.new("Handles")
+				pcall(function() h.Style = Enum.HandlesStyle.MoveRotate end)
+				h.Faces = { Enum.NormalId.Right, Enum.NormalId.Top, Enum.NormalId.Back,
+					Enum.NormalId.Left, Enum.NormalId.Bottom, Enum.NormalId.Front }
+				h.Adornee = anchor
+				h.Parent = anchor
+				gizmo = h
+
+				local base = m:GetPivot()
+				h.MouseButton1Down:Connect(function()
+					base = m:GetPivot()
+					dragging = { mode = "native", model = m, base = base }
+				end)
+				h.MouseDrag:Connect(function(face, distance)
+					if not dragging or dragging.mode ~= "native" then return end
+					local normal = Vector3.FromNormalId(face)
+					local np = snapVec(dragging.base.Position + normal * distance, buildState.MoveIncrement)
+					local cf = CFrame.new(np) * rotOnly(dragging.base)
+					dragging.model:PivotTo(cf)
+					if anchor then anchor.CFrame = cf end
+					updateLine(cf.Position, cf.Position + normal * 4)
+				end)
+				h.MouseButton1Up:Connect(finishDrag)
+			else
+				local a = Instance.new("ArcHandles")
+				a.Axes = { Enum.Axis.Y }
+				a.Adornee = anchor
+				a.Parent = anchor
+				gizmo = a
+
+				local base = m:GetPivot()
+				a.MouseButton1Down:Connect(function()
+					base = m:GetPivot()
+					dragging = { mode = "native", model = m, base = base }
+				end)
+				a.MouseDrag:Connect(function(_axis, angle)
+					if not dragging or dragging.mode ~= "native" then return end
+					local cf = dragging.base * CFrame.Angles(0, angle, 0)
+					dragging.model:PivotTo(cf)
+					if anchor then anchor.CFrame = cf end
+					local plane = CFrame.lookAt(cf.Position, cf.Position + Workspace.CurrentCamera.CFrame.LookVector)
+					local hit = rayPlane(viewportRay(pointer.X, pointer.Y), plane)
+					if hit then updateLine(cf.Position, hit) end
+				end)
+				a.MouseButton1Up:Connect(finishDrag)
+			end
 		end
 
 		------------------------------------------------
@@ -3424,7 +3527,7 @@ createMasterUI = function()
 			lineAdorn = {}
 		end
 
-		local function updateLine(a, b)
+		function updateLine(a, b)
 			local dir = b - a
 			local dist = dir.Magnitude
 			if dist < 0.4 then clearLine(); return end
@@ -3478,7 +3581,7 @@ createMasterUI = function()
 			end
 		end
 
-		local function pushHistory()
+		function pushHistory()
 			if historyBusy then return end
 			table.insert(undoStack, snapshot())
 			if #undoStack > 60 then table.remove(undoStack, 1) end
@@ -3741,12 +3844,19 @@ createMasterUI = function()
 			if freecam.held[Enum.KeyCode.D] then move += Vector3.xAxis end
 			if freecam.held[Enum.KeyCode.E] then move += Vector3.yAxis end
 			if freecam.held[Enum.KeyCode.Q] then move -= Vector3.yAxis end
-			if freecam.controls then
+
+			if IS_MOBILE then
+				local stick = readThumbstick()
+				if stick.Magnitude > 0.02 then
+					move += Vector3.new(stick.X, 0, stick.Y)
+				end
+			elseif freecam.controls then
 				local v = freecam.controls:GetMoveVector()
 				if v.Magnitude > 0.05 then
 					move += Vector3.new(v.X, 0, -v.Y)
 				end
 			end
+
 			local rot = CFrame.Angles(0, freecam.yaw, 0) * CFrame.Angles(freecam.pitch, 0, 0)
 			if move.Magnitude > 0.01 then
 				freecam.pos += rot:VectorToWorldSpace(move.Unit * (42 * dt)) * math.min(1, move.Magnitude)
@@ -3760,23 +3870,8 @@ createMasterUI = function()
 		end)
 
 		------------------------------------------------
-		-- DRAGGING
+		-- CURSOR DRAG (model body only)
 		------------------------------------------------
-		local function beginHandleDrag(hit)
-			local model = primary()
-			if not model then return end
-			local pivot = model:GetPivot()
-			if hit.id == "Rotate" then
-				dragging = { mode = "rotate", model = model, pivot = pivot, startX = pointer.X }
-				return
-			end
-			local axis = (hit.id == "X" and Vector3.xAxis) or (hit.id == "Z" and Vector3.zAxis) or Vector3.yAxis
-			local plane = axisPlane(anchor.CFrame.Position, axis)
-			local startHit = rayPlane(viewportRay(pointer.X, pointer.Y), plane)
-			if not startHit then return end
-			dragging = { mode = "axis", model = model, pivot = pivot, axis = axis, plane = plane, startHit = startHit }
-		end
-
 		local function beginModelDrag(model, hitPos)
 			local pivot = model:GetPivot()
 			if tool == "Rotate" then
@@ -3798,19 +3893,12 @@ createMasterUI = function()
 			end
 
 			if not dragging then return end
+			if dragging.mode == "native" then return end
 			local model = dragging.model
 			if not model or not model.Parent then dragging = nil; clearLine(); return end
 			local rot = rotOnly(dragging.pivot)
 
-			if dragging.mode == "axis" then
-				local hit = rayPlane(viewportRay(pointer.X, pointer.Y), dragging.plane)
-				if hit then
-					local delta = (hit - dragging.startHit):Dot(dragging.axis)
-					local np = snapVec(dragging.pivot.Position + dragging.axis * delta, buildState.MoveIncrement)
-					local cf = CFrame.new(np) * rot
-					model:PivotTo(cf); moveHandles(cf); updateLine(cf.Position, hit)
-				end
-			elseif dragging.mode == "free" then
+			if dragging.mode == "free" then
 				local hit = surfaceRay()
 				if hit then
 					local np = hit.Position + dragging.offset
@@ -3821,7 +3909,9 @@ createMasterUI = function()
 						np = snapVec(np, buildState.MoveIncrement)
 					end
 					local cf = CFrame.new(np) * rot
-					model:PivotTo(cf); moveHandles(cf); updateLine(cf.Position, hit.Position)
+					model:PivotTo(cf)
+					if anchor then anchor.CFrame = cf end
+					updateLine(cf.Position, hit.Position)
 				end
 			elseif dragging.mode == "rotate" then
 				local dx = pointer.X - dragging.startX
@@ -3832,7 +3922,8 @@ createMasterUI = function()
 					angle = math.round(raw / step) * step
 				end
 				local cf = dragging.pivot * CFrame.Angles(0, angle, 0)
-				model:PivotTo(cf); moveHandles(cf)
+				model:PivotTo(cf)
+				if anchor then anchor.CFrame = cf end
 				local plane = CFrame.lookAt(cf.Position, cf.Position + Workspace.CurrentCamera.CFrame.LookVector)
 				local hit = rayPlane(viewportRay(pointer.X, pointer.Y), plane)
 				if hit then updateLine(cf.Position, hit) end
@@ -3844,16 +3935,10 @@ createMasterUI = function()
 		------------------------------------------------
 		local function pressStart()
 			if not buildState.IsConstructing then return end
-
-			if tool then
-				local h = pickHandle()
-				if h and primary() then beginHandleDrag(h); return end
-			end
-
 			local model, hitPos = structRay()
-			if not model then return end
 
 			if not tool then
+				if not model then return end
 				if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
 					toggleSelection(model)
 				else
@@ -3862,11 +3947,7 @@ createMasterUI = function()
 				return
 			end
 
-			if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
-				toggleSelection(model)
-			elseif not table.find(selected, model) then
-				setSelection({ model })
-			end
+			if not model or not table.find(selected, model) then return end
 
 			if tool == "Delete" then deleteSelected()
 			elseif tool == "Copy" then cloneSelected()
@@ -3877,7 +3958,7 @@ createMasterUI = function()
 
 		local function pressEnd()
 			pendingDrag = nil
-			if not dragging then return end
+			if not dragging or dragging.mode == "native" then return end
 			pushHistory()
 			dragging = nil
 			clearLine()
@@ -3911,7 +3992,7 @@ createMasterUI = function()
 			elseif i.UserInputType == Enum.UserInputType.Touch then
 				if freecam.active then
 					if i == freecam.lookTouch then
-						local sens = buildState.CameraSensitivity or 0.3
+						local sens = buildState.CameraSensitivity or 0.12
 						freecam.yaw -= i.Delta.X * sens
 						freecam.pitch = math.clamp(freecam.pitch - i.Delta.Y * sens, math.rad(-89), math.rad(89))
 					end
@@ -3997,7 +4078,7 @@ createMasterUI = function()
 
 		local function addAnother()
 			local name = buildState.StructureName
-			if not name or name == "" then return end
+			if name == "" then return end
 			pushHistory()
 			spawnInFront(name)
 		end
@@ -4044,19 +4125,24 @@ createMasterUI = function()
 		end
 
 		------------------------------------------------
-		-- PICKER
-		------------------------------------------------
-		local openStructurePicker
-
-		------------------------------------------------
 		-- STRUCTURE SETTINGS
 		------------------------------------------------
 		local _, structBody = createExpandPanel(p, "Structure Settings", "Pick or type the model to place")
 		local structureBox = createTextBox(structBody, "Structure Model Name", "e.g. Shelter", buildState.StructureName, function(v)
 			buildState.StructureName = v
 		end, "Name of the model to place")
-		local pickBtn = createButton(structBody, "Browse Structures", Color3.fromRGB(45, 78, 145), "Open the full structure list")
-		pickBtn.MouseButton1Click:Connect(function() openStructurePicker() end)
+		local pickBtn = createButton(structBody, "Browse Structures", Color3.fromRGB(45, 78, 145), "Open the structure list with previews")
+		pickBtn.MouseButton1Click:Connect(function()
+			local entries = {}
+			for _, n in ipairs(collectStructureNames()) do
+				table.insert(entries, { name = n, value = n, model = getStructureByName(n) })
+			end
+			openPicker("SELECT STRUCTURE", entries, function(e)
+				buildState.StructureName = e.value
+				structureBox.Text = e.value
+				showNotification("Selected: " .. e.value, 1.2)
+			end)
+		end)
 
 		createToggle(structBody, "Auto Complete Structures", autoCompleteStructures, function(v)
 			autoCompleteStructures = v
@@ -4070,7 +4156,7 @@ createMasterUI = function()
 		------------------------------------------------
 		-- CONSTRUCT SETTINGS
 		------------------------------------------------
-		local _, setBody = createExpandPanel(p, "Construct Settings", "Increments and cursor dragging")
+		local _, setBody = createExpandPanel(p, "Construct Settings", "Increments, dragging and freecam")
 		createSlider(setBody, "Move Increment", 0, 20, buildState.MoveIncrement, 0.5, function(v) buildState.MoveIncrement = v end, "Grid step used by the move tool")
 		createSlider(setBody, "Rotate Increment", 0, 90, buildState.RotateIncrement, 1, function(v) buildState.RotateIncrement = v end, "Degrees per rotate step (0 = free)")
 		createToggle(setBody, "Drag Model To Cursor", buildState.DragToCursor, function(v)
@@ -4078,80 +4164,8 @@ createMasterUI = function()
 		end, "Dragging a model follows your cursor and the terrain under it", false)
 
 		if IS_MOBILE then
-			createSlider(setBody, "Camera Sensitivity", 0, 0.3, buildState.CameraSensitivity, 0.01,
-				function(v) buildState.CameraSensitivity = v end, "Freecam look speed on touch (0 = frozen)")
-		end
-
-		------------------------------------------------
-		-- PICKER PANEL
-		------------------------------------------------
-		openStructurePicker = function()
-			local old = gui:FindFirstChild("StructurePicker"); if old then old:Destroy() end
-			local vp = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(1280, 720)
-			local w = math.min(430, vp.X - 40)
-			local h = math.min(470, vp.Y - 80)
-			local f = make("Frame", { Name = "StructurePicker", Size = UDim2.fromOffset(w, 0),
-				Position = UDim2.new(0.5, -w / 2, 0.5, -h / 2), BackgroundColor3 = T.Bg2, BorderSizePixel = 0,
-				ClipsDescendants = true, ZIndex = 70 }, gui)
-			corner(f, 12); stroke(f, T.Accent, 0.15, 1.5)
-			TweenService:Create(f, TweenInfo.new(0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
-				{ Size = UDim2.fromOffset(w, h) }):Play()
-
-			make("TextLabel", { Size = UDim2.new(1, -30, 0, 26), Position = UDim2.fromOffset(16, 10),
-				BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "SELECT STRUCTURE",
-				TextColor3 = T.Text, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left }, f)
-
-			local search = make("TextBox", { Size = UDim2.new(1, -32, 0, 30), Position = UDim2.fromOffset(16, 40),
-				PlaceholderText = "Search...", Text = "" }, f)
-			styleField(search)
-
-			local list = make("ScrollingFrame", { Size = UDim2.new(1, -32, 1, -132), Position = UDim2.fromOffset(16, 78),
-				BackgroundColor3 = T.Field, BorderSizePixel = 0, CanvasSize = UDim2.new(), ScrollBarThickness = 4,
-				AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarImageColor3 = T.Accent }, f)
-			corner(list, 8); stroke(list, T.Stroke, 0.5)
-			make("UIListLayout", { Padding = UDim.new(0, 4) }, list)
-			make("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6),
-				PaddingRight = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6) }, list)
-
-			local names = collectStructureNames()
-
-			local function fill(filter)
-				for _, c in ipairs(list:GetChildren()) do
-					if c:IsA("TextButton") then c:Destroy() end
-				end
-				filter = (filter or ""):lower()
-				local shown = 0
-				for _, name in ipairs(names) do
-					if filter == "" or name:lower():find(filter, 1, true) then
-						local b = make("TextButton", { Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = T.PanelD,
-							Font = Enum.Font.GothamMedium, Text = name, TextColor3 = T.Text, TextSize = 11,
-							TextXAlignment = Enum.TextXAlignment.Left, AutoButtonColor = false }, list)
-						make("UIPadding", { PaddingLeft = UDim.new(0, 10) }, b); corner(b, 7)
-						hover(b, T.PanelD, T.Hover)
-						b.MouseButton1Click:Connect(function()
-							playClick()
-							buildState.StructureName = name
-							structureBox.Text = name
-							f:Destroy()
-							showNotification("Selected: " .. name, 1.2)
-						end)
-						shown += 1
-					end
-				end
-				if shown == 0 then
-					make("TextLabel", { Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1,
-						Font = Enum.Font.GothamMedium, Text = "no matches", TextColor3 = T.Dim,
-						TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left }, list)
-				end
-			end
-			fill("")
-			search:GetPropertyChangedSignal("Text"):Connect(function() fill(search.Text) end)
-
-			local close = make("TextButton", { Size = UDim2.new(1, -32, 0, 26), Position = UDim2.new(0, 16, 1, -34),
-				BackgroundColor3 = Color3.fromRGB(150, 55, 55), Font = Enum.Font.GothamBold, Text = "Close",
-				TextColor3 = T.Text, TextSize = 11, AutoButtonColor = false }, f)
-			corner(close, 8); stroke(close, T.Stroke, 0.4)
-			close.MouseButton1Click:Connect(function() playClick(); f:Destroy() end)
+			createSlider(setBody, "Camera Sensitivity", 0.01, 0.2, buildState.CameraSensitivity, 0.01,
+				function(v) buildState.CameraSensitivity = v end, "Freecam look speed on touch")
 		end
 
 		------------------------------------------------
@@ -4335,7 +4349,7 @@ createMasterUI = function()
 		createSlider(protBody, "Extras Interval", 0.2, 10, protectExtras.Interval, 0.2, function(v) protectExtras.Interval = v end, "Loop delay for custom item")
 		createTextBox(protBody, "Custom Item (protect only)", "e.g. Boulder", protectExtras.CustomItem, function(v) protectExtras.CustomItem = v end, "Leave empty to use the throwable only")
 		createSlider(protBody, "Custom Item Count", 1, 80, protectExtras.Count, 1, function(v) protectExtras.Count = v end, "Items per protect throw")
-		createTextBox(protBody, "Delay After Item", "e.g. 0.08", tostring(protExtras.Delay), function(v)
+		createTextBox(protBody, "Delay After Item", "e.g. 0.08", tostring(protectExtras.Delay), function(v)
 			local n = tonumber(v); if n then protectExtras.Delay = n end
 		end, "Delay between protect throws")
 
@@ -4499,21 +4513,11 @@ createMasterUI = function()
 
 		local buildStatsEditor
 
-		local function itemStatsEntries()
+		local function itemStatsNames()
 			local names = {}
 			for k in pairs(ItemStats) do table.insert(names, tostring(k)) end
 			table.sort(names)
-			local list = {}
-			for _, n in ipairs(names) do
-				local d = ItemStats[n]
-				table.insert(list, {
-					text = n .. "   [" .. tostring(d and d.Type or "?") .. "]",
-					value = n,
-					image = d and d.Icon,
-				})
-			end
-			if #list == 0 then table.insert(list, { text = "no items found", value = "none" }) end
-			return list
+			return names
 		end
 
 		buildStatsEditor = function(name)
@@ -4614,12 +4618,22 @@ createMasterUI = function()
 			end
 		end
 
-		local statsDrop = createDropdown(p, "Item Stats Editor", itemStatsEntries(), function(e)
-			if e.value == "none" then return end
-			buildStatsEditor(e.value)
-		end, { tip = "Pick an item, then edit any of its keys below",
-			onToggle = function(open) if open and not statsSnapshot then snapshotAllStats() end end })
-		statsDrop.setEntries(itemStatsEntries())
+		local statsPickBtn = createButton(p, "Browse Items", Color3.fromRGB(45, 78, 145),
+			"Open the item list with previews")
+		statsPickBtn.MouseButton1Click:Connect(function()
+			if not statsSnapshot then snapshotAllStats() end
+			local entries = {}
+			for _, n in ipairs(itemStatsNames()) do
+				local d = ItemStats[n]
+				table.insert(entries, {
+					name = n .. "   [" .. tostring(d and d.Type or "?") .. "]",
+					value = n,
+					image = d and d.Icon,
+					model = (not (d and d.Icon)) and (getThrowableModel(n) or getStructureByName(n)) or nil,
+				})
+			end
+			openPicker("SELECT ITEM", entries, function(e) buildStatsEditor(e.value) end)
+		end)
 
 		local statsBtnRow = make("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, p)
 		local statsSave = createButton(statsBtnRow, "Save To Disk", Color3.fromRGB(38, 110, 60),
@@ -4846,11 +4860,11 @@ createMasterUI = function()
 		end
 	end
 
-	local grip = make("TextButton", { Size = UDim2.new(0, 20, 0, 20), Position = UDim2.new(1, -20, 1, -20),
-		BackgroundTransparency = 1, Text = "", ZIndex = 8 }, main)
+	local grip = make("TextButton", { Size = UDim2.new(0, 22, 0, 22), Position = UDim2.new(1, -22, 1, -22),
+		BackgroundTransparency = 1, Text = "", ZIndex = 9 }, main)
 	for i = 1, 3 do
 		make("Frame", { Size = UDim2.new(0, 2 + i * 3, 0, 2), Position = UDim2.new(1, -(3 + i * 4), 1, -(3 + i * 4)),
-			AnchorPoint = Vector2.new(1, 1), BackgroundColor3 = T.Accent, BackgroundTransparency = 0.35, BorderSizePixel = 0, ZIndex = 8 }, grip)
+			AnchorPoint = Vector2.new(1, 1), BackgroundColor3 = T.Accent, BackgroundTransparency = 0.35, BorderSizePixel = 0, ZIndex = 9 }, grip)
 	end
 	local resizing, rStart, rStartSize
 	grip.InputBegan:Connect(function(i)
@@ -4862,13 +4876,17 @@ createMasterUI = function()
 	UserInputService.InputChanged:Connect(function(i)
 		if resizing and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
 			local d = i.Position - rStart
-			main.Size = UDim2.new(0, math.clamp(rStartSize.X.Offset + d.X, 420, 1400), 0, math.clamp(rStartSize.Y.Offset + d.Y, 300, 900))
-			glow.Size = main.Size
-			currentNormal = main.Size
+			local newSize = UDim2.new(0, math.clamp(rStartSize.X.Offset + d.X, 420, 1400),
+				0, math.clamp(rStartSize.Y.Offset + d.Y, 300, 900))
+			main.Size = newSize
+			glow.Size = newSize
+			currentNormal = newSize
 		end
 	end)
 	UserInputService.InputEnded:Connect(function(i)
-		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then resizing = false end
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			resizing = false
+		end
 	end)
 
 	local dragging, dragStart, startPos, dragInput
