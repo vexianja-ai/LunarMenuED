@@ -1,10 +1,13 @@
 --[[
-	LUNAR MENU — v2.6.0
-	+ Builder gizmos now use the native Handles / ArcHandles objects
-	+ Selection only with an empty tool slot; tools act on the selected model
-	+ Shared searchable picker with 3D thumbnails for structures and item stats
-	+ Mobile freecam reads the real thumbstick; sensitivity 0.01 – 0.2
-	+ Fixed protect-extras typo that killed resize / minimise
+	LUNAR MENU — v2.6.1
+	+ Handles / ArcHandles now actually render (anchor part + Faces.new)
+	+ Tools toggle off when clicked again; selected model click unselects
+	+ Empty sandbox auto-cancels the session
+	+ Copy no longer leaves stale adornments / stuck drag state
+	+ Mobile freecam uses draggable ▲ / ▼ buttons, camera-relative
+	+ Camera Speed slider (0.12 – 1.5)
+	+ Undo / Redo are arm-then-click tools
+	+ No dotted line while moving
 ]]--
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -244,7 +247,7 @@ end
 ----------------------------------------------------
 local LOGO_ID = "rbxassetid://8498174594"
 local KEYBIND_IMG = "rbxassetid://126810011338788"
-local VERSION = "v2.6.0"
+local VERSION = "v2.6.1"
 
 local function make(class, props, parent)
 	local i = Instance.new(class)
@@ -399,6 +402,7 @@ local buildState = {
 	ViewportViewModel = nil,
 	ViewportCharModel = nil,
 	CameraSensitivity = 0.12,
+	CameraSpeed = 0.12,
 }
 
 ----------------------------------------------------
@@ -3292,6 +3296,7 @@ createMasterUI = function()
 		buildState.RotateIncrement = buildState.RotateIncrement or 15
 		if buildState.DragToCursor == nil then buildState.DragToCursor = true end
 		buildState.CameraSensitivity = math.clamp(buildState.CameraSensitivity or 0.12, 0.01, 0.2)
+		buildState.CameraSpeed = math.clamp(buildState.CameraSpeed or 0.12, 0.12, 1.5)
 
 		local SANDBOX_NAME = "LunarConstructSandbox"
 		local HANDLE_NAME = "LunarConstructHandles"
@@ -3314,9 +3319,11 @@ createMasterUI = function()
 
 		local freecam = { active = false, savedCF = nil, savedFOV = 70, savedType = nil,
 			yaw = 0, pitch = 0, pos = Vector3.zero, held = {}, zoom = 0,
-			zoomInHeld = false, zoomOutHeld = false, controls = nil, lookTouch = nil }
+			zoomInHeld = false, zoomOutHeld = false, fwdHeld = false, backHeld = false,
+			controls = nil, lookTouch = nil }
 
 		local freecamStart, freecamStop
+		local cancelConstruct
 
 		local assetsRoot = ReplicatedStorage:FindFirstChild("Assets")
 
@@ -3439,6 +3446,13 @@ createMasterUI = function()
 			clearHandles()
 		end
 
+		local function ensureNotEmpty()
+			if buildState.IsConstructing and #allModels() == 0 then
+				showNotification("Sandbox empty — construct cancelled", 1.6)
+				if cancelConstruct then cancelConstruct() end
+			end
+		end
+
 		------------------------------------------------
 		-- NATIVE GIZMOS
 		------------------------------------------------
@@ -3463,20 +3477,29 @@ createMasterUI = function()
 		function refreshHandles()
 			clearHandles()
 			local m = primary()
-			if not m or not tool then return end
+			if not m or not m.Parent or not tool then return end
 			if tool ~= "Move" and tool ~= "Rotate" then return end
 
-			anchor = make("Part", { Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
-				CastShadow = false, Transparency = 1, Size = Vector3.new(0.2, 0.2, 0.2),
-				CFrame = m:GetPivot() }, handleFolder)
+			local part = Instance.new("Part")
+			part.Name = "LunarHandleAnchor"
+			part.Anchored = true
+			part.CanCollide = false
+			part.CanQuery = false
+			part.CanTouch = false
+			part.CastShadow = false
+			part.Transparency = 1
+			part.Size = Vector3.new(0.2, 0.2, 0.2)
+			part.CFrame = m:GetPivot()
+			anchor = part
 
 			if tool == "Move" then
 				local h = Instance.new("Handles")
 				pcall(function() h.Style = Enum.HandlesStyle.MoveRotate end)
-				h.Faces = { Enum.NormalId.Right, Enum.NormalId.Top, Enum.NormalId.Back,
-					Enum.NormalId.Left, Enum.NormalId.Bottom, Enum.NormalId.Front }
-				h.Adornee = anchor
-				h.Parent = anchor
+				pcall(function()
+					h.Faces = Faces.new(Enum.NormalId.Right, Enum.NormalId.Top, Enum.NormalId.Back,
+						Enum.NormalId.Left, Enum.NormalId.Bottom, Enum.NormalId.Front)
+				end)
+				h.Adornee = part
 				gizmo = h
 
 				local base = m:GetPivot()
@@ -3491,14 +3514,13 @@ createMasterUI = function()
 					local cf = CFrame.new(np) * rotOnly(dragging.base)
 					dragging.model:PivotTo(cf)
 					if anchor then anchor.CFrame = cf end
-					updateLine(cf.Position, cf.Position + normal * 4)
 				end)
 				h.MouseButton1Up:Connect(finishDrag)
+				h.Parent = part
 			else
 				local a = Instance.new("ArcHandles")
-				a.Axes = { Enum.Axis.Y }
-				a.Adornee = anchor
-				a.Parent = anchor
+				pcall(function() a.Axes = Axes.new(Enum.Axis.Y) end)
+				a.Adornee = part
 				gizmo = a
 
 				local base = m:GetPivot()
@@ -3516,7 +3538,10 @@ createMasterUI = function()
 					if hit then updateLine(cf.Position, hit) end
 				end)
 				a.MouseButton1Up:Connect(finishDrag)
+				a.Parent = part
 			end
+
+			part.Parent = handleFolder
 		end
 
 		------------------------------------------------
@@ -3594,6 +3619,7 @@ createMasterUI = function()
 			local prev = table.remove(undoStack)
 			table.insert(redoStack, current)
 			historyBusy = true; restore(prev); historyBusy = false
+			ensureNotEmpty()
 		end
 
 		local function doRedo()
@@ -3602,6 +3628,7 @@ createMasterUI = function()
 			local nxt = table.remove(redoStack)
 			table.insert(undoStack, current)
 			historyBusy = true; restore(nxt); historyBusy = false
+			ensureNotEmpty()
 		end
 
 		------------------------------------------------
@@ -3612,6 +3639,7 @@ createMasterUI = function()
 			pushHistory()
 			for _, m in ipairs(selected) do m:Destroy() end
 			clearSelection()
+			ensureNotEmpty()
 		end
 
 		local function cloneSelected()
@@ -3620,10 +3648,15 @@ createMasterUI = function()
 			local made = {}
 			for _, m in ipairs(selected) do
 				local c = m:Clone()
+				for _, d in ipairs(c:GetDescendants()) do
+					if d:IsA("SelectionBox") then d:Destroy() end
+				end
 				c.Parent = sandbox
 				c:PivotTo(m:GetPivot() + Vector3.new(math.max(buildState.MoveIncrement, 1) * 2, 0, 0))
 				table.insert(made, c)
 			end
+			dragging = nil
+			pendingDrag = nil
 			setSelection(made)
 		end
 
@@ -3677,6 +3710,15 @@ createMasterUI = function()
 			TextColor3 = T.Text, TextSize = 24, Visible = false, ZIndex = 15 }, hotbarGui)
 		corner(zoomOut, 999); stroke(zoomOut, T.Stroke, 0.4)
 
+		local fwdBtn = make("TextButton", { Size = UDim2.fromOffset(58, 58), Position = UDim2.new(1, -86, 1, -300),
+			BackgroundColor3 = T.Panel, BackgroundTransparency = 0.15, Font = Enum.Font.GothamBold, Text = "▲",
+			TextColor3 = T.Text, TextSize = 22, Visible = false, ZIndex = 15 }, hotbarGui)
+		corner(fwdBtn, 999); stroke(fwdBtn, T.Stroke, 0.4)
+		local backBtn = make("TextButton", { Size = UDim2.fromOffset(58, 58), Position = UDim2.new(1, -86, 1, -370),
+			BackgroundColor3 = T.Panel, BackgroundTransparency = 0.15, Font = Enum.Font.GothamBold, Text = "▼",
+			TextColor3 = T.Text, TextSize = 22, Visible = false, ZIndex = 15 }, hotbarGui)
+		corner(backBtn, 999); stroke(backBtn, T.Stroke, 0.4)
+
 		local keyHud = make("Frame", { Size = UDim2.fromOffset(196, 96), Position = UDim2.new(1, -14, 1, -122),
 			AnchorPoint = Vector2.new(1, 1), BackgroundColor3 = T.Bg2, BackgroundTransparency = 0.25,
 			Visible = false }, hotbarGui)
@@ -3692,14 +3734,14 @@ createMasterUI = function()
 		local function highlightTool(id)
 			for toolId, b in pairs(toolButtons) do
 				local on = (toolId == id)
-				b.BackgroundColor3 = on and T.Accent or T.Panel
-				b.ImageTransparency = on and 0 or 0.15
-				b.Size = on and UDim2.fromOffset(60, 60) or UDim2.fromOffset(52, 52)
+				b.BackgroundColor3 = on and T.Accent:Lerp(T.Panel, 0.6) or T.Panel
+				b.ImageTransparency = on and 0.05 or 0.2
+				b.Size = on and UDim2.fromOffset(56, 56) or UDim2.fromOffset(52, 52)
 				local s = toolStrokes[toolId]
 				if s then
-					s.Thickness = on and 2.5 or 1
-					s.Color = on and Color3.new(1, 1, 1) or T.Stroke
-					s.Transparency = on and 0 or 0.5
+					s.Thickness = on and 1.8 or 1
+					s.Color = on and T.Accent or T.Stroke
+					s.Transparency = on and 0.2 or 0.5
 				end
 			end
 		end
@@ -3710,6 +3752,13 @@ createMasterUI = function()
 				highlightTool(nil)
 				clearHandles()
 				if freecam.active then freecamStop() else freecamStart() end
+				return
+			end
+			if tool == id then
+				tool = nil
+				highlightTool(nil)
+				clearHandles()
+				showNotification("Tool put down", 1)
 				return
 			end
 			if #selected == 0 and (id == "Move" or id == "Rotate") then
@@ -3761,6 +3810,8 @@ createMasterUI = function()
 					held = true; moved = false; pressAt = i.Position; startPos = btn.Position
 					if btn == zoomIn then freecam.zoomInHeld = true end
 					if btn == zoomOut then freecam.zoomOutHeld = true end
+					if btn == fwdBtn then freecam.fwdHeld = true end
+					if btn == backBtn then freecam.backHeld = true end
 				end
 			end)
 			btn.InputChanged:Connect(function(i)
@@ -3779,11 +3830,15 @@ createMasterUI = function()
 					held = false
 					if btn == zoomIn then freecam.zoomInHeld = false end
 					if btn == zoomOut then freecam.zoomOutHeld = false end
+					if btn == fwdBtn then freecam.fwdHeld = false end
+					if btn == backBtn then freecam.backHeld = false end
 				end
 			end)
 		end
 		makeDraggableButton(zoomIn)
 		makeDraggableButton(zoomOut)
+		makeDraggableButton(fwdBtn)
+		makeDraggableButton(backBtn)
 
 		------------------------------------------------
 		-- FREECAM IMPL
@@ -3815,7 +3870,8 @@ createMasterUI = function()
 			local hum = freecamHumanoid(); if hum then hum.WalkSpeed = 0 end
 			if UserInputService.MouseEnabled then UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter end
 			zoomIn.Visible = true; zoomOut.Visible = true
-			showNotification(IS_MOBILE and "Freecam — thumbstick move, drag to look" or
+			fwdBtn.Visible = true; backBtn.Visible = true
+			showNotification(IS_MOBILE and "Freecam — ▲/▼ move, drag right side to look" or
 				"Freecam — WASD move, Q/E zoom, Esc exit", 2)
 		end
 
@@ -3825,6 +3881,8 @@ createMasterUI = function()
 			freecam.lookTouch = nil
 			freecam.zoomInHeld = false
 			freecam.zoomOutHeld = false
+			freecam.fwdHeld = false
+			freecam.backHeld = false
 			local cam = Workspace.CurrentCamera
 			cam.CameraType = freecam.savedType or Enum.CameraType.Custom
 			cam.FieldOfView = freecam.savedFOV or 70
@@ -3832,6 +3890,7 @@ createMasterUI = function()
 			freecam.held = {}
 			local hum = freecamHumanoid(); if hum then hum.WalkSpeed = 12 end
 			zoomIn.Visible = false; zoomOut.Visible = false
+			fwdBtn.Visible = false; backBtn.Visible = false
 		end
 		uiRefs.freecamActive = function() return freecam.active end
 
@@ -3846,10 +3905,8 @@ createMasterUI = function()
 			if freecam.held[Enum.KeyCode.Q] then move -= Vector3.yAxis end
 
 			if IS_MOBILE then
-				local stick = readThumbstick()
-				if stick.Magnitude > 0.02 then
-					move += Vector3.new(stick.X, 0, stick.Y)
-				end
+				if freecam.fwdHeld then move += Vector3.zAxis end
+				if freecam.backHeld then move -= Vector3.zAxis end
 			elseif freecam.controls then
 				local v = freecam.controls:GetMoveVector()
 				if v.Magnitude > 0.05 then
@@ -3857,9 +3914,10 @@ createMasterUI = function()
 				end
 			end
 
+			local speed = 42 * ((buildState.CameraSpeed or 0.12) / 0.12)
 			local rot = CFrame.Angles(0, freecam.yaw, 0) * CFrame.Angles(freecam.pitch, 0, 0)
 			if move.Magnitude > 0.01 then
-				freecam.pos += rot:VectorToWorldSpace(move.Unit * (42 * dt)) * math.min(1, move.Magnitude)
+				freecam.pos += rot:VectorToWorldSpace(move.Unit * (speed * dt)) * math.min(1, move.Magnitude)
 			end
 			Workspace.CurrentCamera.CFrame = CFrame.new(freecam.pos) * rot
 			if freecam.held[Enum.KeyCode.Q] then freecam.zoom = math.min(freecam.zoom + dt, 1) end
@@ -3911,7 +3969,6 @@ createMasterUI = function()
 					local cf = CFrame.new(np) * rot
 					model:PivotTo(cf)
 					if anchor then anchor.CFrame = cf end
-					updateLine(cf.Position, hit.Position)
 				end
 			elseif dragging.mode == "rotate" then
 				local dx = pointer.X - dragging.startX
@@ -3935,11 +3992,19 @@ createMasterUI = function()
 		------------------------------------------------
 		local function pressStart()
 			if not buildState.IsConstructing then return end
+			if freecam.active then return end
+
+			if tool == "Undo" then doUndo(); return end
+			if tool == "Redo" then doRedo(); return end
+
 			local model, hitPos = structRay()
 
 			if not tool then
-				if not model then return end
-				if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+				if not model then
+					clearSelection()
+					return
+				end
+				if table.find(selected, model) or UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
 					toggleSelection(model)
 				else
 					setSelection({ model })
@@ -3970,12 +4035,13 @@ createMasterUI = function()
 				pointer = Vector2.new(i.Position.X, i.Position.Y)
 			end
 			if freecam.active then
-				if i.UserInputType == Enum.UserInputType.Touch and not freecam.lookTouch then
+				if i.UserInputType == Enum.UserInputType.Touch and not gp and not freecam.lookTouch then
 					local vp = Workspace.CurrentCamera.ViewportSize
 					if i.Position.X > vp.X * 0.35 then freecam.lookTouch = i end
 				end
 				return
 			end
+			if gp then return end
 			if not buildState.IsConstructing then return end
 			if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
 				pressStart()
@@ -4040,7 +4106,7 @@ createMasterUI = function()
 				and Color3.fromRGB(140, 95, 40) or Color3.fromRGB(38, 166, 91)
 		end
 
-		local function cancelConstruct()
+		cancelConstruct = function()
 			if not buildState.IsConstructing then return end
 			pendingDrag = nil
 			freecamStop()
@@ -4162,6 +4228,9 @@ createMasterUI = function()
 		createToggle(setBody, "Drag Model To Cursor", buildState.DragToCursor, function(v)
 			buildState.DragToCursor = v
 		end, "Dragging a model follows your cursor and the terrain under it", false)
+
+		createSlider(setBody, "Camera Speed", 0.12, 1.5, buildState.CameraSpeed, 0.01,
+			function(v) buildState.CameraSpeed = v end, "Freecam travel speed — 0.12 is the current default")
 
 		if IS_MOBILE then
 			createSlider(setBody, "Camera Sensitivity", 0.01, 0.2, buildState.CameraSensitivity, 0.01,
